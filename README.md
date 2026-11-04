@@ -403,6 +403,76 @@ Standalone audio must accompany an image or video reference. Audio references
 must be 2–15 seconds; at most three audio inputs are accepted and their total
 decoded duration is capped at 15 seconds.
 
+### 9. Apply a style LoRA
+
+A style LoRA is a safetensors checkpoint with low-rank updates for the
+diffusion transformer. The engine merges the updates into the released BF16
+DiT weights before the int8 quantization pass, so every generation path
+(resident weights, SSD streaming, BF16 fallbacks) uses the adapted model.
+
+```sh
+./h3 -d ./MiniMax-H3 -p "A lighthouse in a storm." \
+  --lora style/anime-film.safetensors --lora-scale 0.8 \
+  --width 512 --height 512 --frames 22 --steps 20 \
+  -o outputs/lighthouse-style.mp4
+```
+
+`--lora-scale` multiplies the checkpoint alpha and defaults to `1.0`. The
+effective strength is `alpha / rank * scale`, where `alpha` comes from the
+safetensors metadata (`alpha`, `network_alpha` or `lora_alpha`) and falls back
+to the rank when the file carries no metadata. The interactive session offers
+the same control with `!lora PATH`, `!lora clear` and `!lora-scale N`; changing
+the checkpoint rebuilds the prepared transformer.
+
+Supported adapter names follow the released checkpoint layout:
+
+| Adapter path | Adapted matrix |
+| --- | --- |
+| `blocks.N.attn.qkv_proj` | fused attention QKV projection |
+| `blocks.N.attn.out_proj` | attention output projection |
+| `blocks.N.mlp.fc1` | fused MLP gate and up projection |
+| `blocks.N.mlp.fc2` | MLP down projection |
+| `blocks.N.attn.to_q` / `to_k` / `to_v` | one third of the fused QKV matrix |
+| `blocks.N.mlp.gate_proj` / `up_proj` | one half of the fused FC1 matrix |
+
+Common naming conventions are accepted: `lora_A`/`lora_B`, `lora_down`/
+`lora_up`, and the `transformer.`, `base_model.model.`, `diffusion_model.` and
+`model.` prefixes are stripped. Adapters that do not match the checkpoint
+shapes are reported and skipped instead of failing the run.
+
+### 10. Apply a step-acceleration LoRA
+
+Step-acceleration LoRAs (LightX2V, CausVid, Self-Forcing style) are trained
+for a small number of denoising steps, so they need the schedule they were
+trained with. The engine reads that schedule from the checkpoint metadata and
+adopts it automatically:
+
+```sh
+./h3 -d ./MiniMax-H3 -p "A lighthouse in a storm." \
+  --lora accel/lightx2v-h3.safetensors \
+  --width 512 --height 512 --frames 22 -o outputs/lighthouse-fast.mp4
+```
+
+The metadata keys `steps` (or `num_steps`, `acceleration_steps`) and `shift`
+(or `sigma_shift`, `flow_shift`) carry the recommended values. The engine
+prints what it adopted:
+
+```text
+h3: LoRA accel/lightx2v-h3.safetensors: 50 adapters, alpha 16, scale 1
+h3: LoRA requests 4 denoising steps
+h3: LoRA requests a 7 flow shift
+```
+
+`--lora-steps N` forces a step count and `--lora-shift S` forces a flow
+shift. An explicit `--steps N` keeps the requested step count instead of the
+checkpoint recommendation. The interactive session offers the same controls
+with `!lora-steps N` and `!lora-shift N`.
+
+The merge itself is a single fused Metal pass that adds the low-rank update to
+the BF16 weight in place, so it costs one read and one write of the target
+matrix. In `--ssd-streaming` mode the merge repeats with every streamed layer
+read, which is the price of keeping only two block slots in memory.
+
 ## Tests and runtime requirements
 
 ```sh
@@ -554,6 +624,75 @@ interactive DiT is ready for its next denoiser evaluation. Measurements reached
 about 13--14.6 GiB/s from the internal SSD. `H3_PROFILE=1` reports total bytes,
 read throughput, and the part of the read wait that was not hidden by GPU work.
 
+A style LoRA is merged into the same weights, so the merge follows the
+residency mode. Resident blocks are merged right after they are read from the
+checkpoint and before the int8 quantization pass. Streamed blocks are merged
+into their slot as soon as the background reader finishes, inside the command
+buffer that runs the next block. The merge evaluates the low-rank update with
+a tiled 16x16 product in F32 and rounds the result back to BF16 in the same
+pass, so it reads and writes the target matrix exactly once and needs no
+large temporary buffers.
+
+### Derived-state cache (opt-in)
+
+`H3_INT8_CACHE=<dir>` persists two derived products of the checkpoint so later
+loads skip the work that produced them. Both are written from the exact tensors
+the kernels consume, so a hit cannot change a frame.
+
+- `<dir>/<hash>/adaln.bin` holds the materialized AdaLN modulation tables for
+  one sigma grid: 50 block tables plus the final table, `time_rows × 96,768`
+  BF16 each (65 MB at 4 steps, 215 MB at 20). It removes the ~24 GiB AdaLN
+  read and the 50 projections per load. The key covers the step count, both
+  flow shifts, the conditioning flags, and the row count.
+- `<dir>/<hash>/block-NN.bin` holds each block's post-LoRA int8
+  qkv/out/fc1/fc2 matrices and their per-row scales (385 MB per block, 18 GiB
+  for all 50). It removes the BF16 reads and the quantization pass. The key
+  covers the LoRA file identity and scale; the cache is skipped under
+  `--ssd-streaming` and under any `H3_INT8_KEEP_BF16_*` flag.
+
+The hash covers every shard's path, size, and mtime, so a replaced checkpoint
+misses. `INT8_CACHE_VERSION` in `h3_dit.c` must be bumped when the quantizer or
+the row-scale layout changes; a mismatch is rejected and recomputed rather than
+trusted. Enabling the directory only *reads*: a run never writes unless you also
+set `H3_INT8_CACHE_WRITE=1`, because one populated variant costs about 18 GiB. On an M5 Pro at
+512x512, 22 frames, 4 steps: DiT load 36.6 s without the cache, 24.9 s with the
+AdaLN tables, 8.4 s with both; the whole DiT phase drops from 64.4 s to 29.1 s
+with byte-identical frames. The first run pays the 18 GiB write, and the cache
+directory wants roughly 19 GiB of free space.
+
+`H3_COND_CACHE=<dir>` persists the encoder outputs of a generation - the Qwen
+text embedding, the reference-image condition rows from the video VAE encoder,
+the DiT modality tags and the reference layout - so a later run with the same
+inputs skips the encoders entirely. A hit measured 114 s to 77 s at 864x480 and
+22 frames, which is the ~74 s of text, vision and reference encoding a 1344x768
+run pays. Entries are small (about 11 MB of embedding plus a few MB of rows) and
+`H3_COND_CACHE_WRITE=1` is still required to fill them.
+
+The key covers the prompt, the reference files, the render canvas and
+`--reference-image-size`, but **not** the seed - so repeated draws at one canvas
+(gacha, same-canvas refinement, chained segments of equal length and size) all
+hit. The canvas is in the key because reference images are resampled to the
+target area and the text sequence grows with the vision spans.
+
+`H3_COND_CARRY_ACROSS_CANVAS=1` drops the canvas from the key, which is exact
+rather than approximate **when the reference images are smaller than the render
+area**: `h3_reference_image_canvas` clamps their scale to 1.0, so the encoder
+outputs are byte-identical across canvases. Verified with 640x640 refs at
+864x480 and 1344x768 - the reference-image conditioning, the audio conditioning,
+the modality tags and the reference layout all hashed equal, and only the text
+embedding differed (which it does between two identical runs anyway). A
+two-pass tail carrying pass 1's conditioning measured 310 s against 342 s for
+recomputing it, with the same detail and 0.99 composition correlation. With
+1024x1024 refs the scale is below 1.0 at both canvases and the conditioning
+genuinely differs, so leave the flag off.
+
+Each write and restore prints a fingerprint of the payload. That is what proves
+the round trip faithful, and it also showed that two identical commands encode
+*different* conditioning - in F32 as well as BF16 - so the encoders are not
+reproducible run to run. A cache hit therefore pins one realization rather than
+merely saving time; treat "same seed, same prompt" as insufficient for a quality
+A/B at one canvas until that is understood.
+
 ### Metal 4 and TensorOps paths
 
 M5 GPUs automatically use native BF16 Metal 4/TensorOps for the DiT QKV and
@@ -615,13 +754,65 @@ staging buffers and packing blits.
 
 ### Scheduling and activation memory
 
-The DiT core is split into two ordered Metal command buffers so GPU execution
-of the first part overlaps CPU encoding of the second. Thermal-balanced ABBA
-measurements select a 60%-depth split on M5 (30/50, 27/45, and 24/40), with
-roughly 0.5-1.8% wins; M3 automatically splits only the validated 30/50 case,
-which measured 1.2% faster, because 24/40 regressed there. The operation order
-and generated bytes are unchanged. `H3_DIT_COMMAND_BLOCKS=0` restores one
-command buffer; values 1-50 override the split for further tuning.
+The DiT core is split into ordered Metal command buffers so GPU execution
+of one part overlaps CPU encoding of the next. M5 batches eight DiT blocks
+per command buffer by default: on an M5 Pro that measured 19% faster at
+512-class geometry and 26% faster at 864-class geometry than one buffer per
+block, with bit-identical output, because the per-block case spent seconds
+per evaluation encoding long sequences. Set
+`H3_DIT_CONTINUE_EVERY_BLOCK=1` to restore one buffer per block, or
+`H3_DIT_COMMAND_BLOCKS=N` to override the batch size (4-16 measured within a
+few percent of each other; `0` emits one buffer per evaluation). Non-M5 GPUs
+keep the per-block default and the validated 30/50 batch on request. The
+operation order and generated bytes are unchanged by any of these settings.
+
+The serving sampler integrates the flow ODE with a first-order Euler step.
+`--sampler ab2` (or `H3_SAMPLER=ab2`) selects a second-order Adams-Bashforth
+update that reuses the previous evaluation's velocity at no extra model cost.
+On the 512-square, 22-frame fox test, 14-step AB2 ran 30% faster than the
+20-step Euler default and matched its trajectory accuracy against a 40-step
+Euler reference (18.5 versus 19.1 dB PSNR; plain 14-step Euler fell to
+10.7 dB), with frame-to-frame activity closer to the reference (13.5 versus
+12.0 mean absolute change). It produces a different sample and is therefore
+opt-in; Euler remains the default and both solvers leave the audio stream on
+the same schedule. `--shift N` (or the equivalent `--video-shift N`) overrides
+the video flow sigma shift (default 12), and `--audio-shift N` sets the audio
+stream's shift, previously reachable only through `H3_AUDIO_SHIFT`. Both accept
+(0.5, 100) and both values enter the prepared-DiT key, so a cached DiT can
+never be reused under a different schedule.
+
+`--knots LIST` replaces the released uniform timestep grid with an explicit
+descending list of `steps + 1` timesteps from 1000 down to 0, each mapped
+through the video and audio shifts. Adapters that ship their own sampling
+schedule need it: Pika H3 Flex records `1000,750,500,250,100,40,0` at video
+shift 12 and audio shift 3 and states that generic six-step sampling is not
+equivalent — through shift 12 its last two sigmas land on 0.57 and 0.33 while
+the uniform grid is still at 0.86 and 0.71. Distills such as the turbo LoRAs
+list no knots and assume the uniform grid, so the flag stays unset for them.
+Note that this tail-heavy shape is the family that lost the low-budget grid
+search above for the *base* model; the question is which adapter is being
+sampled, not which grid is generically better. Without knots the builder is
+value-for-value the released grid.
+Fewer steps prefer a larger shift: on the 512-square fox and surfer tests,
+AB2 at 12 steps with `--shift 16` measured 24.6/27.6 dB against a 40-step
+reference versus 17.4/18.0 dB at the default shift, i.e. Euler-20 quality
+with eight fewer evaluations; ten steps plateaus near 20 dB regardless of
+shift. The second-order weight is clamped to +/-1 (`H3_AB2_CLAMP`); removing
+the clamp drops the 12-step result by 1.2 dB because adjacent step-size ratios
+can reach two orders of magnitude. `H3_SKIP_CACHE=<threshold>` skips a forward when the previous step moved the
+video latent by less than the threshold in relative L2 norm (warmup and tail
+steps never skip, at most two consecutive skips). At 512-square with AB2 it
+stays safe only for one or two late skips (24.9-25.1 dB against a 40-step
+reference); six or more skips collapse to about 15 dB because small latent
+motion early in the schedule still hides large direction changes. It is off by
+default.
+`--sampler heun` (predictor-corrector with a trapezoid correction from the
+next evaluation) is kept for experiments but loses to the clamped AB2:
+12 steps/shift 16 measured 24.6 dB for AB2 versus 24.1 for Heun, and 14/shift
+12 measured 24.1 versus 21.5. Below 12 steps the schedule needs more shift and
+quality falls quickly: 10 steps/shift 20 measured 22.2 dB and 8 steps at any
+shift measured about 20 dB against the 40-step reference, so 12 steps/shift 16
+is the practical knee.
 DiT activation buffers also follow their actual intra-block lifetimes: the QKV
 projection arena is reused first for attention heads and then for the normalized
 MLP input, while the current attention-output arena becomes the MLP output after
@@ -650,6 +841,155 @@ element (about 136 MB at the 768p shape). M3 and older GPUs retain the CPU
 sampler by default. `H3_CPU_SAMPLER=1` restores it on M5;
 `H3_GPU_SAMPLER=1` selects the GPU-state path explicitly, and
 `H3_GPU_SAMPLER_WINDOW=0` enables the slower unbounded encode-ahead diagnostic.
+
+### Two-pass sampling (opt-in)
+
+`--dump-latent PATH` writes the joint video/audio latent after denoising, and
+`--init-latent PATH` starts a run from that dump instead of from pure noise. The
+dumped video grid is bilinearly refined to the new canvas and then re-noised to
+the schedule's first sigma with the released forward process
+`x = (1 - sigma) * x0 + sigma * noise`. Re-noising is the point: resampling the
+*noisy* latent would smooth away the high-frequency noise, so the model would be
+handed a sample whose noise is not what that sigma means at that resolution.
+
+`--knots` supplies the second pass's sigma ladder. Pika H3 Flex's last two
+schedule points are `--knots 100,40,0` (sigma 0.5714, 0.3333, 0 at video shift
+12), which reproduces the tail of its own six-step recipe on a larger canvas.
+`--audio-frozen` zeroes the audio schedule so every audio Euler delta is zero and
+the dialogue recorded by the first pass survives the refinement unchanged; it
+requires `--init-latent`. Both passes must keep the same prompt, references and
+frame count — the temporal and audio shapes are checked on load, and a knot grid
+starting below 1000 is rejected without `--init-latent` because there would be
+nothing to re-noise. A missing or truncated dump fails before any weight loads.
+
+`--refine-pixels` changes how the dumped latent reaches the new canvas. Without
+it the latent is bilinearly resampled, which measured unusable: at both a
+1.5556x and an exact 2x ratio the tail steps rendered the interpolation
+structure as dark strokes over fine fur, while the same handoff with no
+resampling at all stayed clean — so the problem is leaving the image manifold,
+not the ratio. With the flag the pass decodes the dumped latent, resamples the
+frames with vImage, and re-encodes them, at the cost of one extra VAE decode and
+encode at the target canvas.
+
+Measured on the S17 shot, 480p to 768p, same seed and references. Pass 1 is
+Flex six steps unless the row says otherwise; the last three rows stop pass 1 at
+sigma 0.923 instead (four steps of `--knots 1000,875,750,625,500`):
+
+| Handoff | Result | Wall (both passes) |
+| --- | --- | --- |
+| bilinear on the clean latent | dark strokes over fur, colour fringing on the shell | 8.8 min |
+| bilinear on a clean latent, exact 2x ratio | worse strokes: the ratio is not the problem | 8.8 min |
+| no resampling at all, same handoff sigma | clean: the resampler is the problem | 8.2 min |
+| bilinear on a still-noisy sample (continued trajectory) | a full-frame rainbow moire | 11.5 min |
+| VAE round-trip (`--refine-pixels`) | clean, but softer than native | 20.4 min |
+| sigma 0.923 handoff, **one** tail step | red cast on the shell strap, flatter: not usable | 8.0 min |
+| sigma 0.923 handoff, **two** tail steps | **clean and sharp, no ghost** | **9.8 min** |
+| sigma 0.923 handoff, three tail steps | clean; indistinguishable from two at 1:1 | 11.2 min |
+| native six steps at 768p | the reference | 11.2 min |
+
+Profiled per-phase costs (instrumented runs): pass 1 at 864x480 is 16 s of
+reference-image encoding, 15 s of text encoding, 48 s of DiT loading, **25 s per
+denoise step**, 31 s of decoding. A 1344x768 tail is 38 s of reference encoding,
+34 s of text encoding, 46 s of DiT loading, 80 s of decoding and about **100 s
+per step** (the first measured 88 s, the second 114 s, the third 96 s; an earlier
+single 7.2 min reading for the three-step arm was an outlier — it profiles at
+8.2 min).
+
+**The 768p decode's 80 s is GPU-bound, not command-encoding bound.** Read in the
+serial path (`H3_VAE_PIPELINE=0`), where every tile commits through
+`h3_gpu_submit` and the wait is accounted honestly, the same decode splits into
+8.1 s encoding and **59.9 s waiting on the GPU**. The pipelined path reports that
+same 60 s as 62 s of "encode", because `encodeToCommandBuffer` blocks on queue
+backpressure while the GPU is behind and the blocked time lands in the encode
+counter. The tell was the spread, not the mean: fastest 0.016 ms, slowest 42 ms
+against a 9.5 ms average. **So trimming graph-encoding work — pre-transposed
+weights, batching tiles — cannot recover more than the 8 s that is genuinely
+CPU, and the decode's cost is real compute.**
+
+Those figures are the `--vae-bf16` path, which is what the profiled rows above
+use. Benchmarked on the same grid (17x48x84 latent, 56 frames, three chunks,
+interleaved twice, machine otherwise idle), the decode is **240 s in F32 and
+70 s in BF16 — 3.4x** with 9.55 GiB vs 4.81 GiB Metal live, matching the
+44–49 dB near-losslessness measured elsewhere. GPU-bound holds in both
+precisions; F32 just multiplies the compute side by ~3.4x. **That precision
+switch, not any encode-side restructuring, is the large lever on this stage**,
+which is why F32 stays the default (bit-identical output) and speed runs opt in
+with `--vae-bf16`.
+
+Two consequences. First, a 768p tail costs about **3.3 minutes of
+canvas-independent overhead** plus 1.7 minutes per step, so one step cannot fall
+below 5.0 min and two below 6.8 min. Second, and more honestly: **repeating the
+same configuration varies by up to 20%** (pass 1 measured 3.0 then 3.6 minutes),
+which is larger than the gap to native. Treat two-pass as **cost-neutral against
+native** (9.8–10.4 min versus 11.2) and value it for composition iteration, not
+for speed.
+
+Each pass is a separate process, so it is a complete generation pipeline with a
+preseeded latent — nothing is shared with pass 1 except the dump. Holding that
+state in one process instead removes the DiT load and LoRA merge (46 s) and, if
+pass 1 does not need to be reviewed as video, its decode (31 s). It does **not**
+remove the ~74 s of reference-image, vision and text encoding, because those are
+bound to the render canvas, not to the process: reference images are resampled
+to the target area and the text sequence grows with the vision spans. Only when
+the references are small enough that `h3_reference_image_canvas` clamps their
+scale to 1.0 at both canvases is that encoding genuinely canvas-independent —
+verified byte-for-byte with 640x640 refs — and in that case a single process
+could reuse it too. That reuse needs a layout rebuild that keeps the weight store
+resident, since `h3_dit` currently prepares one canvas per instance.
+
+The mechanism, settled by correlating each result's high-pass against the same
+base lanczos-upscaled to the target canvas (after an FFT shift search, which
+always returned zero offset and 0.95 luminance correlation): **the tail steps
+re-invent all texture at every sigma above zero — high-frequency correlation with
+the lifted base measured 0.003 to 0.014 — while the composition transfers at
+0.95.** A handoff at mid sigma is therefore a superposition of where the lift put
+the subject and where the model puts it, which is what the doubled glasses and
+doubled heads look like. Lowering the sigma makes it worse, not better.
+
+So two-pass buys **composition control, not detail**. Stop pass 1 high in the
+schedule and it inherits composition only, cleanly; stop it low and it tries to
+inherit detail and ghosts instead:
+
+```
+h3 ... --lora pika_h3_flex_ref2va_comfy_bf16.safetensors --steps 4 --shift 12 \
+       --audio-shift 3 --knots 1000,875,750,625,500 --width 864 --height 480 \
+       --dump-latent /tmp/seed.latent
+h3 ... --lora pika_h3_flex_ref2va_comfy_bf16.safetensors --steps 2 --shift 12 \
+       --audio-shift 3 --knots 500,125,0 --init-latent /tmp/seed.latent \
+       --audio-frozen --width 1344 --height 768
+```
+
+Two tail steps are enough at sigma 0.923 even though one step from sigma 0.333
+smears: the model's velocity is well conditioned for a large jump in the
+structure regime and badly conditioned for one in the detail regime. The saving
+is inside the noise floor of repeated runs, because the 768p fixed cost is paid
+either way; the win is that reviewing a composition costs 3.0-3.6 minutes per
+attempt instead of 11.2, and only the chosen draft pays the tail.
+
+The SelfLift handoff was tried and removed. It keeps pass 1's sample at its own
+sigma instead of projecting it clean, and lets pass 2 consume it verbatim instead
+of re-noising, so both passes share one noise realisation. It worked numerically,
+but with the bilinear lift it measures worse than re-noising: bilinearly
+resampling a noise field correlates it, and the model renders that correlation as
+content — a full-frame rainbow moire at 11.5 min. A partial pass therefore always
+projects the clean endpoint it predicts at its stop sigma, and every second pass
+re-noises. Nothing in the tree carries that opt-out anymore.
+
+What did pay off is the solver: `--sampler renoise` beat Euler on every grid
+tested, and the released Flex ladder is
+`--knots 1000,750,500,250,100,40,0` (matching the official ComfyUI
+`ManualSigmas` to six decimals) — a grid is only valid together with its
+solver.
+
+### Canvas beyond 768p (opt-in)
+
+The released package documents 480p/768p as the local output range, and
+`H3_MAX_PIXELS` enforces that ceiling. `--oversize` (or `H3_CANVAS_LIMIT=<pixels>`)
+raises it to four times the released count. Measured at 1920x1088, 39 frames,
+six steps: it runs without hitting the memory wall in 17.2 minutes, but the
+extra pixels are not backed by extra detail — texture scale grows with the
+canvas instead of resolving more, and the 1:1 crops are softer than a native
+768p frame. Treat it as a framing/compositing escape hatch, not a quality path.
 
 ### Checkpoint layout and media pipeline
 

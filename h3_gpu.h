@@ -102,6 +102,13 @@ int h3_gpu_linear_f32(h3_gpu *gpu, h3_gpu_tensor *output,
                       const h3_gpu_tensor *input, const h3_gpu_tensor *weight,
                       const h3_gpu_tensor *bias, uint32_t rows,
                       uint32_t input_dim, uint32_t output_dim);
+/* Merge a low-rank update into a BF16 weight matrix. The down matrix holds
+ * [rows, rank] and the up matrix holds [columns, rank]. The weight may be
+ * updated in place. */
+int h3_gpu_lora_merge_bf16(h3_gpu *gpu, h3_gpu_tensor *weight,
+                           const h3_gpu_tensor *down,
+                           const h3_gpu_tensor *up, uint32_t rows,
+                           uint32_t columns, uint32_t rank, float scale);
 int h3_gpu_patch_linear_bf16(h3_gpu *gpu, h3_gpu_tensor *output,
                              const h3_gpu_tensor *input,
                              const h3_gpu_tensor *weight,

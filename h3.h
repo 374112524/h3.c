@@ -69,6 +69,17 @@ typedef struct {
     int steps;
     uint64_t seed;
     const char *output_path;
+    /* Optional style-LoRA checkpoint. Its low-rank updates are merged into
+     * the DiT transformer weights before generation. */
+    const char *lora_path;
+    float lora_scale;
+    /* Denoising steps used with the LoRA. Zero follows the checkpoint
+     * recommendation, a negative value keeps the requested step count, and
+     * a positive value forces that many steps. Step-acceleration LoRAs are
+     * trained for a small number of steps. */
+    int lora_steps;
+    /* Flow shift used with the LoRA. Zero keeps the checkpoint shift. */
+    float lora_shift;
     const char *first_frame;
     const char *last_frame;
     const h3_reference *references;

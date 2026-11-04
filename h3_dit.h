@@ -3,6 +3,8 @@
 
 #include "h3_gpu.h"
 #include "h3_host.h"
+#include "h3_latent_io.h"
+#include "h3_lora.h"
 #include "h3_text_encoder.h"
 
 #include <stddef.h>
@@ -19,12 +21,14 @@ typedef int (*h3_dit_preview)(int completed_steps, int total_steps,
 
 /* Load a text-only FL2VA transformer. Text refinement and AdaLN precomputation
  * happen before the persistent core is loaded. SSD streaming retains only the
- * small block norms and two alternating BF16 matrix slots. */
+ * small block norms and two alternating BF16 matrix slots. The optional LoRA
+ * checkpoint is merged into the block weights and owned by the transformer. */
 h3_dit *h3_dit_load_t2va(const char *weight_directory,
                          const char *shader_source_path,
                          const h3_text_embedding *text,
                          const h3_layout *layout,
                          const h3_sigma_schedule *sigmas,
+                         h3_lora *lora,
                          unsigned active_blocks,
                          unsigned core_reuse_interval,
                          int token_reduction,
@@ -53,6 +57,7 @@ h3_dit *h3_dit_load_conditioned(
                          const h3_text_embedding *text,
                          const h3_layout *layout,
                          const h3_sigma_schedule *sigmas,
+                         h3_lora *lora,
                          unsigned active_blocks,
                          unsigned core_reuse_interval,
                          int token_reduction,

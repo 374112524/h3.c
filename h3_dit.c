@@ -71,11 +71,49 @@ struct h3_dit {
     h3_gpu *gpu;
     h3_weight_store *weights;
     h3_dit_schedule *schedule;
+    h3_lora *lora;
+    /* Pre-quantized block cache (H3_INT8_CACHE): see int8_cache_restore. */
+    char int8_cache_dir[640];
+    int int8_cache_ready;
+    int int8_cache_write;
     int fused_mlp;
     int nax_mlp;
     int int8_mlp;
     int int8_qkv;
     int int8_attention_out;
+    int skip_cache_sampler;
+    float skip_cache_threshold;
+    unsigned skip_cache_warmup;
+    unsigned skip_cache_tail;
+    h3_gpu_tensor *skip_prev_x;
+    h3_gpu_tensor *skip_cur_x;
+    h3_gpu_tensor *skip_partials_a;
+    h3_gpu_tensor *skip_partials_b;
+    float *skip_host_a;
+    float *skip_host_b;
+    int heun_sampler;
+    h3_gpu_tensor *heun_video_x;
+    h3_gpu_tensor *heun_audio_x;
+    /* Stochastic renoise solver: projects to the clean estimate each step and
+     * re-noises it with fresh Gaussian noise, matching the released Flex
+     * schedule. Noise is generated on the host with the run's own generators
+     * and uploaded per step, so a repeated seed repeats the trajectory. */
+    int renoise_sampler;
+    uint64_t run_seed;
+    h3_gpu_tensor *renoise_video_noise;
+    h3_gpu_tensor *renoise_audio_noise;
+    float *renoise_host_video;
+    float *renoise_host_audio;
+    h3_rng renoise_video_rng;
+    h3_rng renoise_audio_rng;
+    int broadcast_attention;
+    uint32_t broadcast_k;
+    h3_gpu_tensor *broadcast_cache;
+    unsigned char *broadcast_valid;
+    h3_gpu_tensor *step_cache_partials_x;
+    h3_gpu_tensor *step_cache_partials_v;
+    float *step_cache_host_x;
+    float *step_cache_host_v;
     int keep_bf16_qkv;
     int keep_bf16_attention_out;
     int use_slower_row_major_attention_output;
@@ -525,6 +563,36 @@ static int load_block(h3_dit *dit, h3_dit_block *block, const char *prefix,
     return 1;
 }
 
+/* Merge the LoRA adapters of one DiT block into its BF16 matrices. The
+ * merge is encoded into the open Metal command buffer, so the caller owns
+ * the begin and submit calls. */
+static int merge_lora_block(h3_dit *dit, h3_dit_block *block,
+                             const char *prefix, char *error,
+                             size_t error_size) {
+    if (!dit->lora || !h3_lora_active(dit->lora)) return 1;
+    h3_lora_layout layout = {HEADS, HEAD_DIM, INNER, FFN};
+    char scope[128];
+    snprintf(scope, sizeof(scope), "%sattn", prefix);
+    if (block->qkv &&
+        !h3_lora_merge(dit->lora, dit->gpu, block->qkv, scope,
+                       H3_LORA_MODULE_QKV, INNER * 3, HIDDEN, &layout,
+                       error, error_size)) return 0;
+    if (block->out &&
+        !h3_lora_merge(dit->lora, dit->gpu, block->out, scope,
+                       H3_LORA_MODULE_OUT, HIDDEN, INNER, &layout,
+                       error, error_size)) return 0;
+    snprintf(scope, sizeof(scope), "%smlp", prefix);
+    if (block->fc1 &&
+        !h3_lora_merge(dit->lora, dit->gpu, block->fc1, scope,
+                       H3_LORA_MODULE_FC1, FFN * 2, HIDDEN, &layout,
+                       error, error_size)) return 0;
+    if (block->fc2 &&
+        !h3_lora_merge(dit->lora, dit->gpu, block->fc2, scope,
+                       H3_LORA_MODULE_FC2, HIDDEN, FFN, &layout,
+                       error, error_size)) return 0;
+    return 1;
+}
+
 static int load_block_norms(h3_dit *dit, h3_dit_block *block,
                             const char *prefix,
                             char *error, size_t error_size) {
@@ -845,6 +913,10 @@ static int refine_text(h3_dit *dit, const h3_text_embedding *text,
     }
     ok = gpu_op(dit, h3_gpu_begin(dit->gpu), error, error_size,
                 "begin token refinement") &&
+         merge_lora_block(dit, &refiner[0], "token_refiner.blocks.0.",
+                          error, error_size) &&
+         merge_lora_block(dit, &refiner[1], "token_refiner.blocks.1.",
+                          error, error_size) &&
          gpu_op(dit, h3_gpu_linear_bf16(
              dit->gpu, dit->refined_text, source, condition_w, condition_b,
              dit->text_rows, TEXT_DIM, HIDDEN), error, error_size,
@@ -861,6 +933,7 @@ static int refine_text(h3_dit *dit, const h3_text_embedding *text,
              "refiner final norm") &&
          gpu_op(dit, h3_gpu_submit(dit->gpu), error, error_size,
                 "submit token refinement");
+    if (dit->lora) h3_lora_flush(dit->lora);
 cleanup:
     free_tensor(&source);
     free_tensor(&condition_w);
@@ -1238,8 +1311,213 @@ static void configure_gate_ranked_blocks(h3_dit *dit) {
     }
 }
 
+/* ---- Pre-quantized block cache -----------------------------------------
+ * Loading the BF16 shards is I/O bound: the loader maps the checkpoint and
+ * the quantization pass faults ~62 GiB through the GPU. Persisting the int8
+ * matrices and their row scales removes the qkv/out/fc1/fc2 part of that
+ * traffic. The bytes handed to the cache are read back from the exact tensors
+ * the kernels consume, so a hit cannot change the result. Bump
+ * INT8_CACHE_VERSION whenever the quantization kernel or the row-scale layout
+ * changes. */
+enum {
+    INT8_CACHE_MAGIC = 0x38493348u, /* "H3I8" */
+    INT8_CACHE_VERSION = 1u,
+    INT8_CACHE_CHUNK = 4u << 20
+};
+
+typedef struct {
+    uint32_t magic;
+    uint32_t version;
+    uint32_t block;
+    uint32_t rows[4];
+    uint32_t columns[4];
+} int8_cache_header;
+
+static const uint32_t int8_cache_rows[4] = {
+    INNER * 3, HIDDEN, FFN * 2, HIDDEN
+};
+static const uint32_t int8_cache_columns[4] = {
+    HIDDEN, INNER, HIDDEN, FFN
+};
+
+/* Reads one matrix payload straight into its shared Metal buffer: no staging
+ * copy, so a cache hit moves half the bytes the writer needed. */
+static int int8_cache_read_matrix(const char *path, uint64_t matrix_offset,
+                                  uint64_t scales_offset, h3_gpu *gpu,
+                                  h3_gpu_tensor **matrix,
+                                  h3_gpu_tensor **scales,
+                                  uint32_t rows, uint32_t columns) {
+    h3_gpu_tensor *bytes = h3_gpu_tensor_load_i8(
+        gpu, path, matrix_offset, (size_t)rows * columns);
+    h3_gpu_tensor *scale_tensor = h3_gpu_tensor_new_f32(gpu, rows);
+    float *row_scales = malloc((size_t)rows * sizeof(*row_scales));
+    if (!bytes || !scale_tensor || !row_scales) {
+        free(row_scales);
+        h3_gpu_tensor_free(bytes);
+        h3_gpu_tensor_free(scale_tensor);
+        return 0;
+    }
+    FILE *file = fopen(path, "rb");
+    int ok = file && fseeko(file, (off_t)scales_offset, SEEK_SET) == 0 &&
+        fread(row_scales, sizeof(*row_scales), rows, file) == rows;
+    if (file) fclose(file);
+    ok = ok && h3_gpu_tensor_write_f32(scale_tensor, row_scales, rows);
+    free(row_scales);
+    if (!ok) {
+        h3_gpu_tensor_free(bytes);
+        h3_gpu_tensor_free(scale_tensor);
+        return 0;
+    }
+    *matrix = bytes;
+    *scales = scale_tensor;
+    return 1;
+}
+
+static int int8_cache_write_matrix(FILE *file, const h3_gpu_tensor *matrix,
+                                   const h3_gpu_tensor *scales,
+                                   uint32_t rows, uint32_t columns) {
+    size_t elements = (size_t)rows * columns;
+    int8_t *host = malloc((size_t)INT8_CACHE_CHUNK);
+    float *row_scales = malloc((size_t)rows * sizeof(*row_scales));
+    if (!host || !row_scales) {
+        free(host);
+        free(row_scales);
+        return 0;
+    }
+    int ok = 1;
+    for (size_t done = 0; ok && done < elements; ) {
+        size_t count = elements - done < (size_t)INT8_CACHE_CHUNK ?
+            elements - done : (size_t)INT8_CACHE_CHUNK;
+        ok = h3_gpu_tensor_read_i8_range(matrix, done, host, count) &&
+             fwrite(host, 1, count, file) == count;
+        done += count;
+    }
+    ok = ok &&
+         h3_gpu_tensor_read_f32(scales, row_scales, rows) &&
+         fwrite(row_scales, sizeof(*row_scales), rows, file) == rows;
+    free(host);
+    free(row_scales);
+    return ok;
+}
+
+static void int8_cache_setup(h3_dit *dit) {
+    dit->int8_cache_ready = 0;
+    dit->int8_cache_dir[0] = '\0';
+    if (!dit->int8_mlp || !dit->int8_qkv || !dit->int8_attention_out) return;
+    if (dit->ssd_streaming || dit->keep_bf16_qkv ||
+        dit->keep_bf16_attention_out || dit->keep_bf16_mlp) return;
+    char variant[400];
+    if (dit->lora) {
+        const char *path = h3_lora_path(dit->lora);
+        struct stat status;
+        long long size = -1, seconds = -1;
+        if (path && stat(path, &status) == 0) {
+            size = (long long)status.st_size;
+            seconds = (long long)status.st_mtimespec.tv_sec;
+        }
+        snprintf(variant, sizeof(variant), "int8-v1|lora=%s:%lld:%lld:%g",
+                 path ? path : "?", size, seconds, h3_lora_scale(dit->lora));
+    } else {
+        snprintf(variant, sizeof(variant), "int8-v1|lora=none");
+    }
+    if (!h3_cache_directory(dit->weights, variant, dit->int8_cache_dir,
+                            sizeof(dit->int8_cache_dir))) return;
+    dit->int8_cache_write = h3_cache_writes_enabled();
+    dit->int8_cache_ready = 1;
+}
+
+/* Returns 1 when every matrix of the block was restored. */
+static int int8_cache_restore(h3_dit *dit, unsigned block,
+                              h3_dit_block *weights) {
+    if (!dit->int8_cache_ready) return 0;
+    char name[32], path[640];
+    if (snprintf(name, sizeof(name), "block-%02u.bin", block) <= 0 ||
+        !h3_cache_path(dit->int8_cache_dir, name, path, sizeof(path)))
+        return 0;
+    FILE *file = fopen(path, "rb");
+    if (!file) return 0;
+    int8_cache_header header;
+    int ok = fread(&header, sizeof(header), 1, file) == 1 &&
+        header.magic == INT8_CACHE_MAGIC &&
+        header.version == INT8_CACHE_VERSION &&
+        header.block == block;
+    for (unsigned index = 0; ok && index < 4; index++)
+        ok = header.rows[index] == int8_cache_rows[index] &&
+             header.columns[index] == int8_cache_columns[index];
+    fclose(file);
+    if (!ok) return 0;
+    h3_gpu_tensor **matrices[4] = {
+        &weights->qkv_int8, &weights->out_int8,
+        &weights->fc1_int8, &weights->fc2_int8
+    };
+    h3_gpu_tensor **scales[4] = {
+        &weights->qkv_scales, &weights->out_scales,
+        &weights->fc1_scales, &weights->fc2_scales
+    };
+    uint64_t offset = sizeof(header);
+    for (unsigned index = 0; ok && index < 4; index++) {
+        size_t elements = (size_t)int8_cache_rows[index] *
+                          int8_cache_columns[index];
+        ok = int8_cache_read_matrix(path, offset, offset + elements, dit->gpu,
+                                    matrices[index], scales[index],
+                                    int8_cache_rows[index],
+                                    int8_cache_columns[index]);
+        offset += (uint64_t)elements +
+                  (uint64_t)int8_cache_rows[index] * sizeof(float);
+    }
+    if (!ok) {
+        for (unsigned index = 0; index < 4; index++) {
+            h3_gpu_tensor_free(*matrices[index]);
+            *matrices[index] = NULL;
+            h3_gpu_tensor_free(*scales[index]);
+            *scales[index] = NULL;
+        }
+        return 0;
+    }
+    return 1;
+}
+
+static void int8_cache_store(h3_dit *dit, unsigned block,
+                             const h3_dit_block *weights) {
+    if (!dit->int8_cache_ready || !dit->int8_cache_write) return;
+    /* Created lazily: a read-only run must not leave an empty variant. */
+    if (!h3_cache_prepare(dit->int8_cache_dir, NULL, 0)) return;
+    char name[32], path[640], temporary[648];
+    if (snprintf(name, sizeof(name), "block-%02u.bin", block) <= 0 ||
+        !h3_cache_path(dit->int8_cache_dir, name, path, sizeof(path)) ||
+        snprintf(temporary, sizeof(temporary), "%s.tmp", path) <= 0) return;
+    FILE *file = fopen(temporary, "wb");
+    if (!file) return;
+    int8_cache_header header = {
+        INT8_CACHE_MAGIC, INT8_CACHE_VERSION, block,
+        { int8_cache_rows[0], int8_cache_rows[1],
+          int8_cache_rows[2], int8_cache_rows[3] },
+        { int8_cache_columns[0], int8_cache_columns[1],
+          int8_cache_columns[2], int8_cache_columns[3] }
+    };
+    int ok = fwrite(&header, sizeof(header), 1, file) == 1 &&
+        int8_cache_write_matrix(file, weights->qkv_int8, weights->qkv_scales,
+                                int8_cache_rows[0], int8_cache_columns[0]) &&
+        int8_cache_write_matrix(file, weights->out_int8, weights->out_scales,
+                                int8_cache_rows[1], int8_cache_columns[1]) &&
+        int8_cache_write_matrix(file, weights->fc1_int8, weights->fc1_scales,
+                                int8_cache_rows[2], int8_cache_columns[2]) &&
+        int8_cache_write_matrix(file, weights->fc2_int8, weights->fc2_scales,
+                                int8_cache_rows[3], int8_cache_columns[3]);
+    if (fclose(file) != 0) ok = 0;
+    if (ok) {
+        if (rename(temporary, path) != 0) remove(temporary);
+    } else {
+        remove(temporary);
+    }
+    if (getenv("H3_PROFILE"))
+        fprintf(stderr, "h3: int8 cache block %u %s\n", block,
+                ok ? "written" : "write failed");
+}
+
 static int load_core(h3_dit *dit, h3_dit_progress progress, void *opaque,
                      char *error, size_t error_size) {
+    int8_cache_setup(dit);
     for (unsigned index = 0; index < H3_DIT_BLOCKS; index++) {
         if (!dit->block_active[index]) {
             report(progress, opaque, "load transformer core", (int)index + 1,
@@ -1253,9 +1531,33 @@ static int load_core(h3_dit *dit, h3_dit_progress progress, void *opaque,
                                   error, error_size) ||
                 !prepare_stream_layer(dit, index, error, error_size))
                 return 0;
+        } else if (int8_cache_restore(dit, index, &dit->blocks[index])) {
+            if (!load_block_norms(dit, &dit->blocks[index], prefix,
+                                  error, error_size)) return 0;
         } else {
             if (!load_block(dit, &dit->blocks[index], prefix,
                             error, error_size)) return 0;
+            if (dit->lora && h3_lora_active(dit->lora)) {
+                char attn_scope[80];
+                char mlp_scope[80];
+                snprintf(attn_scope, sizeof(attn_scope), "blocks.%u.attn",
+                         index);
+                snprintf(mlp_scope, sizeof(mlp_scope), "blocks.%u.mlp", index);
+                if (h3_lora_has_scope(dit->lora, attn_scope) ||
+                    h3_lora_has_scope(dit->lora, mlp_scope)) {
+                    if (!h3_gpu_begin(dit->gpu) ||
+                        !merge_lora_block(dit, &dit->blocks[index], prefix,
+                                          error, error_size) ||
+                        !h3_gpu_submit(dit->gpu)) {
+                        if (error && error_size && !*error)
+                            fail(error, error_size,
+                                 "cannot merge the LoRA adapters: %s",
+                                 h3_gpu_error(dit->gpu));
+                        return 0;
+                    }
+                    h3_lora_flush(dit->lora);
+                }
+            }
             if (dit->int8_mlp &&
                 !quantize_block_mlp(dit, &dit->blocks[index],
                                     error, error_size)) return 0;
@@ -1265,9 +1567,22 @@ static int load_core(h3_dit *dit, h3_dit_progress progress, void *opaque,
             if (dit->int8_attention_out &&
                 !quantize_block_attention_out(
                     dit, &dit->blocks[index], error, error_size)) return 0;
+            int8_cache_store(dit, index, &dit->blocks[index]);
         }
         report(progress, opaque, "load transformer core", (int)index + 1,
                H3_DIT_BLOCKS);
+    }
+    /* Every resident block has been merged, so the host A/B copies are dead
+     * weight for the rest of the generation. Streamed loads still need them
+     * for the per-block merges. Only release when every usable adapter really
+     * was merged: a later merge would otherwise be skipped silently. */
+    if (!dit->ssd_streaming && dit->lora &&
+        h3_lora_applied_count(dit->lora) >= h3_lora_adapter_count(dit->lora)) {
+        h3_lora_release_host(dit->lora);
+    } else if (!dit->ssd_streaming && dit->lora && getenv("H3_PROFILE")) {
+        fprintf(stderr, "h3: keeping LoRA host copies: %zu of %zu adapters "
+                "merged\n", h3_lora_applied_count(dit->lora),
+                h3_lora_adapter_count(dit->lora));
     }
     if (dit->ssd_streaming) {
         if (!allocate_stream_slot(dit, &dit->stream_slots[0],
@@ -1286,6 +1601,28 @@ static int load_core(h3_dit *dit, h3_dit_progress progress, void *opaque,
             fail(error, error_size, "cannot prime DiT SSD stream: %s",
                  job.error);
             return 0;
+        }
+        if (dit->lora && h3_lora_active(dit->lora)) {
+            char prefix[64];
+            char attn_scope[80];
+            char mlp_scope[80];
+            snprintf(prefix, sizeof(prefix), "blocks.%u.", first);
+            snprintf(attn_scope, sizeof(attn_scope), "blocks.%u.attn", first);
+            snprintf(mlp_scope, sizeof(mlp_scope), "blocks.%u.mlp", first);
+            if (h3_lora_has_scope(dit->lora, attn_scope) ||
+                h3_lora_has_scope(dit->lora, mlp_scope)) {
+                if (!h3_gpu_begin(dit->gpu) ||
+                    !merge_lora_block(dit, &dit->stream_slots[0], prefix, error,
+                                      error_size) ||
+                    !h3_gpu_submit(dit->gpu)) {
+                    if (error && error_size && !*error)
+                        fail(error, error_size,
+                             "cannot merge the LoRA adapters: %s",
+                             h3_gpu_error(dit->gpu));
+                    return 0;
+                }
+                h3_lora_flush(dit->lora);
+            }
         }
         dit->stream_ready_layer = first;
         dit->stream_ready_slot = 0;
@@ -1561,6 +1898,7 @@ static h3_dit *load_dit(const char *weight_directory,
                         const h3_text_embedding *text,
                         const h3_layout *layout,
                         const h3_sigma_schedule *sigmas,
+                        h3_lora *lora,
                         unsigned active_blocks,
                         unsigned core_reuse_interval,
                         int token_reduction,
@@ -1596,8 +1934,10 @@ static h3_dit *load_dit(const char *weight_directory,
     h3_dit *dit = calloc(1, sizeof(*dit));
     if (!dit) {
         fail(error, error_size, "out of memory creating DiT model");
+        h3_lora_free(lora);
         return NULL;
     }
+    dit->lora = lora;
     dit->fused_mlp = getenv("H3_DISABLE_FUSED_MLP") == NULL;
     /* The released final heads are F32, but their inputs are already BF16.
      * Converting these small weights once selects the Iris-derived tiled
@@ -1676,12 +2016,22 @@ static h3_dit *load_dit(const char *weight_directory,
         h3_dit_schedule_prune(dit->schedule, dit->block_active,
                               H3_DIT_BLOCKS);
     }
-    if (!dit->schedule || !prepare_rope(dit, error, error_size) ||
-        !prepare_maps(dit, text, error, error_size) ||
-        !prepare_projection_maps(dit, error, error_size) ||
-        !prepare_token_reduction_maps(dit, error, error_size) ||
-        !load_core(dit, progress, progress_opaque, error, error_size) ||
-        !allocate_activations(dit, error, error_size)) goto failed;
+    h3_gpu_profile_mark(dit->gpu, "schedule precompute");
+    int ok = dit->schedule && prepare_rope(dit, error, error_size);
+    h3_gpu_profile_mark(dit->gpu, "rope");
+    if (ok) ok = prepare_maps(dit, text, error, error_size);
+    if (ok) ok = prepare_projection_maps(dit, error, error_size);
+    if (ok) ok = prepare_token_reduction_maps(dit, error, error_size);
+    h3_gpu_profile_mark(dit->gpu, "row maps");
+    if (ok) ok = load_core(dit, progress, progress_opaque, error, error_size);
+    h3_gpu_profile_mark(dit->gpu, "weights and LoRA");
+    if (ok) ok = allocate_activations(dit, error, error_size);
+    h3_gpu_profile_mark(dit->gpu, "activations");
+    if (!ok) goto failed;
+    if (dit->lora && h3_lora_active(dit->lora) && !dit->ssd_streaming) {
+        fprintf(stderr, "h3: LoRA merged into %zu DiT adapters\n",
+                h3_lora_applied_count(dit->lora));
+    }
     if ((wanted_video_condition && !h3_gpu_tensor_write_f32_range(
              dit->video_input, 0, condition_video_rows,
              wanted_video_condition)) ||
@@ -1703,6 +2053,7 @@ h3_dit *h3_dit_load_t2va(const char *weight_directory,
                          const h3_text_embedding *text,
                          const h3_layout *layout,
                          const h3_sigma_schedule *sigmas,
+                         h3_lora *lora,
                          unsigned active_blocks,
                          unsigned core_reuse_interval,
                          int token_reduction,
@@ -1722,6 +2073,7 @@ h3_dit *h3_dit_load_t2va(const char *weight_directory,
                          h3_dit_progress progress, void *progress_opaque,
                          char *error, size_t error_size) {
     return load_dit(weight_directory, shader_source_path, text, layout, sigmas,
+                    lora,
                     active_blocks, core_reuse_interval, token_reduction,
                     ssd_streaming,
                     spatial_rope_scale,
@@ -1745,6 +2097,7 @@ h3_dit *h3_dit_load_conditioned(
                          const h3_text_embedding *text,
                          const h3_layout *layout,
                          const h3_sigma_schedule *sigmas,
+                         h3_lora *lora,
                          unsigned active_blocks,
                          unsigned core_reuse_interval,
                          int token_reduction,
@@ -1768,6 +2121,7 @@ h3_dit *h3_dit_load_conditioned(
                          h3_dit_progress progress, void *progress_opaque,
                          char *error, size_t error_size) {
     return load_dit(weight_directory, shader_source_path, text, layout, sigmas,
+                    lora,
                     active_blocks, core_reuse_interval, token_reduction,
                     ssd_streaming,
                     spatial_rope_scale,
@@ -2268,14 +2622,16 @@ static int encode_forward(h3_dit *dit, int step, int begin, int submit,
                 return 0;
             }
             completed_blocks++;
-            if (command_blocks &&
-                completed_blocks < dit->active_block_count &&
-                completed_blocks % command_blocks == 0)
+            int should_continue = completed_blocks < dit->active_block_count &&
+                (continue_every_block ||
+                 (command_blocks && completed_blocks % command_blocks == 0));
+            if (should_continue)
                 OP(h3_gpu_continue(dit->gpu), "continue DiT command chain");
             if (stream_started) {
                 int gpu_ok = gpu_op(dit, h3_gpu_submit(dit->gpu),
                                     error, error_size,
                                     "submit streamed DiT block");
+                if (gpu_ok && dit->lora) h3_lora_flush(dit->lora);
                 double wait_started = stream_now();
                 int join_error = pthread_join(stream_thread, NULL);
                 dit->stream_wait_seconds += stream_now() - wait_started;
@@ -2298,11 +2654,32 @@ static int encode_forward(h3_dit *dit, int step, int begin, int submit,
                 dit->stream_ready_slot = stream_job.slot;
                 OP(h3_gpu_begin(dit->gpu),
                    "continue after streamed DiT block");
+                if (dit->lora && h3_lora_active(dit->lora)) {
+                    char prefix[64];
+                    char attn_scope[80];
+                    char mlp_scope[80];
+                    snprintf(prefix, sizeof(prefix), "blocks.%u.",
+                             stream_job.layer);
+                    snprintf(attn_scope, sizeof(attn_scope), "blocks.%u.attn",
+                             stream_job.layer);
+                    snprintf(mlp_scope, sizeof(mlp_scope), "blocks.%u.mlp",
+                             stream_job.layer);
+                    if (h3_lora_has_scope(dit->lora, attn_scope) ||
+                        h3_lora_has_scope(dit->lora, mlp_scope)) {
+                        if (!merge_lora_block(
+                                dit, &dit->stream_slots[stream_job.slot],
+                                prefix, error, error_size)) return 0;
+                    }
+                }
             }
         }
         if (use_token_reduction &&
-            token_reduction_end == H3_DIT_BLOCKS &&
-            !leave_token_reduction(dit, error, error_size)) return 0;
+            token_reduction_end == H3_DIT_BLOCKS) {
+            if (dit->token_reduction_attention_only)
+                dit->token_reduction_active = 0;
+            else if (!leave_token_reduction(dit, error, error_size))
+                return 0;
+        }
         if (dit->core_reuse_interval > 1) {
             OP(h3_gpu_sub_bf16(dit->gpu, dit->core_residual, dit->hidden,
                                dit->core_input, hidden_elements),
@@ -3045,6 +3422,25 @@ void h3_dit_free(h3_dit *dit) {
     FREE(previous_audio_velocity); FREE(previous_video_velocity);
 #undef FREE
     h3_dit_schedule_free(dit->schedule);
+    dit->schedule = NULL;
+    /* Weight-owned state: the block matrices with the LoRA already merged in,
+     * the patch and final heads, and the loaders underneath them. */
+    free_tensor(&dit->video_patch_w); free_tensor(&dit->video_patch_b);
+    free_tensor(&dit->audio_patch_w); free_tensor(&dit->audio_patch_b);
+    for (unsigned block = 0; block < H3_DIT_BLOCKS; block++)
+        free_block(&dit->blocks[block]);
+    free_block(&dit->stream_slots[0]);
+    free_block(&dit->stream_slots[1]);
+    free_tensor(&dit->final_norm);
+    free_tensor(&dit->final_video_w); free_tensor(&dit->final_video_b);
+    free_tensor(&dit->final_audio_w); free_tensor(&dit->final_audio_b);
+    if (dit->lora && getenv("H3_PROFILE") &&
+        h3_lora_merge_count(dit->lora)) {
+        fprintf(stderr,
+                "h3: LoRA merged %zu matrices in %.3fs of host time\n",
+                h3_lora_merge_count(dit->lora),
+                h3_lora_merge_seconds(dit->lora));
+    }
     if (dit->ssd_streaming && getenv("H3_PROFILE")) {
         double gib = (double)dit->stream_bytes / (1024.0 * 1024.0 * 1024.0);
         fprintf(stderr,
@@ -3055,8 +3451,20 @@ void h3_dit_free(h3_dit *dit) {
                     ? gib / dit->stream_read_seconds : 0.0,
                 dit->stream_wait_seconds);
     }
+    if (getenv("H3_PROFILE") && dit->gpu) {
+        h3_gpu_stats stats = {0};
+        if (h3_gpu_get_stats(dit->gpu, &stats))
+            fprintf(stderr,
+                    "h3: GPU %llu submissions, encode %.3fs, wait %.3fs, "
+                    "gpu %.3fs, signal %.3fs (%llu waits)\n",
+                    (unsigned long long)stats.submissions,
+                    stats.command_encode_seconds, stats.command_wait_seconds,
+                    stats.gpu_seconds, stats.signal_wait_seconds,
+                    (unsigned long long)stats.signal_waits);
+    }
     h3_gpu_free(dit->gpu);
     h3_weight_store_free(dit->weights);
+    h3_lora_free(dit->lora);
     h3_layout_free(&dit->layout);
     free(dit);
 }

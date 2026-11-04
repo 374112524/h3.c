@@ -185,6 +185,36 @@ kernel void h3_silu_f32(device const float *input [[buffer(0)]],
     output[gid] = value / (1.0f + exp(-value));
 }
 
+/* Merge a low-rank LoRA update into a BF16 weight matrix in one pass.
+ * The down matrix holds the scattered up-projection rows [rows, rank] and
+ * the up matrix holds the transposed down-projection [columns, rank]. The
+ * base and the output may be the same buffer. */
+struct lora_merge_args {
+    uint32_t rows;
+    uint32_t columns;
+    uint32_t rank;
+    float scale;
+};
+
+kernel void h3_lora_merge_bf16(device const ushort *base [[buffer(0)]],
+                               device const float *down [[buffer(1)]],
+                               device const float *up [[buffer(2)]],
+                               device ushort *output [[buffer(3)]],
+                               constant lora_merge_args &args [[buffer(4)]],
+                               uint2 tid [[thread_position_in_threadgroup]],
+                               uint2 group [[threadgroup_position_in_grid]]) {
+    uint row = group.y * 16 + tid.y;
+    uint column = group.x * 16 + tid.x;
+    if (row >= args.rows || column >= args.columns) return;
+    float sum = 0.0f;
+    for (uint index = 0; index < args.rank; index++)
+        sum = fma(down[row * args.rank + index],
+                  up[column * args.rank + index], sum);
+    uint offset = row * args.columns + column;
+    float value = h3_bf16_to_f32(base[offset]) + args.scale * sum;
+    output[offset] = h3_f32_to_bf16(value);
+}
+
 kernel void h3_cast_f32_to_bf16(device const float *input [[buffer(0)]],
                                 device ushort *output [[buffer(1)]],
                                 constant uint &count [[buffer(2)]],

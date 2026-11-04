@@ -424,15 +424,20 @@ h3_gpu *h3_gpu_create(const char *shader_source_path,
             @"h3_head_rms_norm_bf16", @"h3_rope_text_bf16",
             @"h3_gqa_causal_bf16", @"h3_add_bf16", @"h3_sub_bf16",
             @"h3_token_pool_bf16", @"h3_token_pool_adaln_bf16",
+            @"h3_token_gather_bf16", @"h3_token_pool_avg_bf16",
             @"h3_token_expand_delta_bf16",
             @"h3_token_expand_adaln_bf16",
-            @"h3_euler_bf16", @"h3_silu_mul_bf16",
+            @"h3_euler_bf16", @"h3_renoise_bf16", @"h3_silu_mul_bf16",
             @"h3_weight_norm_f32", @"h3_add_scaled_f32",
             @"h3_alias_free_snake_f32", @"h3_snake1d_f32",
             @"h3_audio_qkv_split_f32", @"h3_audio_attention_pool_f32",
             @"h3_geglu_f32", @"h3_clip_f32",
             @"h3_vae_encoder_pad_f32",
-            @"h3_vae_encoder_group_norm_silu_f32"
+            @"h3_vae_encoder_group_norm_silu_f32",
+            @"h3_lora_merge_bf16",
+            @"h3_weight_bf16_round_f32", @"h3_weight_int8_round_f32",
+            @"h3_mean_abs_f32", @"h3_mean_abs_bf16", @"h3_heun_correct_f32",
+            @"h3_norm2_f32", @"h3_diff_norm2_f32"
         ] mutableCopy];
         if (gpu.tensorOpsEnabled) {
             [names addObject:@"h3_linear_bf16_nax_r128"];
@@ -973,6 +978,7 @@ void h3_gpu_profile_mark(h3_gpu *opaque, const char *phase) {
 }
 
 typedef struct { uint32_t rows, input_dim, output_dim, has_bias; } linear_args;
+typedef struct { uint32_t rows, columns, rank; float scale; } lora_merge_args;
 typedef struct { uint32_t rows, columns; float clip; } int8_quant_args;
 typedef struct {
     uint32_t rows, padded_rows, heads, head_dim;
@@ -1090,6 +1096,49 @@ int h3_gpu_linear_f32(h3_gpu *opaque, h3_gpu_tensor *output,
             [encoder setBuffer:TENSOR(output).buffer offset:0 atIndex:3];
             [encoder setBytes:&args length:sizeof(args) atIndex:4];
         });
+}
+
+int h3_gpu_lora_merge_bf16(h3_gpu *opaque, h3_gpu_tensor *weight,
+                           const h3_gpu_tensor *down,
+                           const h3_gpu_tensor *up, uint32_t rows,
+                           uint32_t columns, uint32_t rank, float scale) {
+    H3GPU *gpu = GPU(opaque);
+    size_t matrix_elements = (size_t)rows * columns;
+    if (!h3_gpu_require_elements(gpu, weight, matrix_elements,
+                                 @"LoRA weight") ||
+        TENSOR(weight).dtype != H3_GPU_BF16 ||
+        !h3_gpu_require_elements(gpu, down, (size_t)rows * rank,
+                                 @"LoRA down matrix") ||
+        TENSOR(down).dtype != H3_GPU_F32 ||
+        !h3_gpu_require_elements(gpu, up, (size_t)columns * rank,
+                                 @"LoRA up matrix") ||
+        TENSOR(up).dtype != H3_GPU_F32) return 0;
+    id<MTLComputePipelineState> pipeline = h3_gpu_pipeline(
+        gpu, @"h3_lora_merge_bf16");
+    if (!pipeline || pipeline.maxTotalThreadsPerThreadgroup < 256) {
+        h3_gpu_set_error(gpu, @"device cannot dispatch the LoRA merge tile");
+        return 0;
+    }
+    if (!h3_gpu_require_command(gpu)) return 0;
+    lora_merge_args args = {rows, columns, rank, scale};
+    @autoreleasepool {
+        id<MTLComputeCommandEncoder> encoder =
+            [gpu.command computeCommandEncoder];
+        [encoder setComputePipelineState:pipeline];
+        [encoder setBuffer:TENSOR(weight).buffer offset:0 atIndex:0];
+        [encoder setBuffer:TENSOR(down).buffer offset:0 atIndex:1];
+        [encoder setBuffer:TENSOR(up).buffer offset:0 atIndex:2];
+        [encoder setBuffer:TENSOR(weight).buffer offset:0 atIndex:3];
+        [encoder setBytes:&args length:sizeof(args) atIndex:4];
+        [encoder dispatchThreadgroups:MTLSizeMake((columns + 15) / 16,
+                                                  (rows + 15) / 16, 1)
+                 threadsPerThreadgroup:MTLSizeMake(16, 16, 1)];
+        [encoder endEncoding];
+    }
+    h3_gpu_stats stats = gpu.stats;
+    stats.direct_dispatches++;
+    gpu.stats = stats;
+    return 1;
 }
 
 int h3_gpu_patch_linear_bf16_offset(

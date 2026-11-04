@@ -45,7 +45,14 @@ static void usage(const char *program) {
         "      --use-slower-uncached-int8-scales  Reread projection scales\n"
         "      --use-slower-dynamic-fc1-k  Use runtime-bound FC1 K loop\n"
         "      --use-slower-grouped-quantizer  Force 256-thread FC2 quantizer\n"
+        "  -h, --help             Show this help\n",
+        program, program, program);
+    fprintf(stderr,
         "      --seed N           Random seed (default: 42)\n"
+        "      --lora PATH        Style-LoRA safetensors checkpoint\n"
+        "      --lora-scale N     LoRA strength multiplier (default: 1)\n"
+        "      --lora-steps N     Denoising steps used with the LoRA\n"
+        "      --lora-shift N     Video flow shift used with the LoRA\n"
         "      --first-frame PATH First-frame conditioning image\n"
         "      --last-frame PATH  Last-frame conditioning image\n"
         "      --ref-image PATH    Append an ordered Ref2VA image\n"
@@ -90,6 +97,87 @@ static int frames_from_seconds(const char *value) {
         exit(2);
     }
     return (int)rounded;
+}
+
+static float parse_scale(const char *value, const char *label) {
+    char *end = NULL;
+    errno = 0;
+    double parsed = strtod(value, &end);
+    if (errno || !end || *end || !isfinite(parsed) || parsed <= 0.0 ||
+        parsed > 8.0) {
+        fprintf(stderr, "h3: invalid %s: %s\n", label, value);
+        exit(2);
+    }
+    return (float)parsed;
+}
+
+/* LoRA shift: zero keeps the checkpoint recommendation, so the lower bound is
+ * inclusive here (unlike the scale, which must be positive). */
+static float parse_shift(const char *value, const char *label) {
+    char *end = NULL;
+    errno = 0;
+    double parsed = strtod(value, &end);
+    if (errno || !end || *end || !isfinite(parsed) || parsed < 0.0 ||
+        parsed > 100.0) {
+        fprintf(stderr, "h3: invalid %s: %s\n", label, value);
+        exit(2);
+    }
+    return (float)parsed;
+}
+
+/* Schedule shifts reach the engine through the environment, the same way the
+ * sampler does; the bounds match the parser in h3.c. */
+static int set_shift_env(const char *value, const char *name,
+                         const char *variable) {
+    char *end = NULL;
+    float shift = strtof(value, &end);
+    if (!end || *end || !(shift > 0.5f) || shift >= 100.0f) {
+        fprintf(stderr, "h3: --%s must be in (0.5, 100)\n", name);
+        return 0;
+    }
+    setenv(variable, value, 1);
+    return 1;
+}
+
+/* The knot grid is matched against the final step count inside the engine;
+ * the CLI only rejects a malformed list so a typo fails before any load. */
+static int set_knots_env(const char *value) {
+    static const char *bad = "h3: --knots must be comma-separated, strictly "
+                             "descending timesteps in [0, 1000]\n";
+    if (!value || !*value) {
+        fprintf(stderr, "%s", bad);
+        return 0;
+    }
+    const char *cursor = value;
+    float previous = 1001.0f;
+    int count = 0;
+    while (*cursor) {
+        char *end = NULL;
+        double parsed = strtod(cursor, &end);
+        while (*end == ' ') end++;
+        if (end == cursor || !isfinite(parsed) || parsed < 0.0 ||
+            parsed > 1000.0 || (float)parsed >= previous) {
+            fprintf(stderr, "%s", bad);
+            return 0;
+        }
+        previous = (float)parsed;
+        count++;
+        if (!*end) break;
+        if (*end != ',') {
+            fprintf(stderr, "%s", bad);
+            return 0;
+        }
+        cursor = end + 1;
+        while (*cursor == ' ') cursor++;
+    }
+    /* Two values is a legal single-step refinement grid; the engine matches
+     * the count against the final step count. */
+    if (count < 2) {
+        fprintf(stderr, "%s", bad);
+        return 0;
+    }
+    setenv("H3_SIGMA_KNOTS", value, 1);
+    return 1;
 }
 
 static uint64_t parse_u64(const char *value, const char *label) {
@@ -248,6 +336,7 @@ int main(int argc, char **argv) {
            OPT_USE_SLOWER_DYNAMIC_FC1_K,
            OPT_USE_SLOWER_GROUPED_QUANTIZER,
            OPT_SEED,
+           OPT_LORA, OPT_LORA_SCALE, OPT_LORA_STEPS, OPT_LORA_SHIFT,
            OPT_FIRST, OPT_LAST, OPT_REF_IMAGE, OPT_REF_IMAGE_SIZE,
            OPT_REF_VIDEO, OPT_REF_SILENT_VIDEO, OPT_REF_VIDEO_AUDIO,
            OPT_REF_AUDIO, OPT_FRAMES_DIR, OPT_SHOW, OPT_ZOOM,
@@ -291,6 +380,10 @@ int main(int argc, char **argv) {
         {"use-slower-grouped-quantizer", no_argument, NULL,
          OPT_USE_SLOWER_GROUPED_QUANTIZER},
         {"seed", required_argument, NULL, OPT_SEED},
+        {"lora", required_argument, NULL, OPT_LORA},
+        {"lora-scale", required_argument, NULL, OPT_LORA_SCALE},
+        {"lora-steps", required_argument, NULL, OPT_LORA_STEPS},
+        {"lora-shift", required_argument, NULL, OPT_LORA_SHIFT},
         {"first-frame", required_argument, NULL, OPT_FIRST},
         {"last-frame", required_argument, NULL, OPT_LAST},
         {"ref-image", required_argument, NULL, OPT_REF_IMAGE},
@@ -343,7 +436,61 @@ int main(int argc, char **argv) {
                 params.frames = frames_from_seconds(optarg);
                 seconds_given = 1;
                 break;
-            case OPT_STEPS: params.steps = parse_int(optarg, "steps"); break;
+            case OPT_STEPS:
+                params.steps = parse_int(optarg, "steps");
+                /* An explicit step count wins over the LoRA recommendation. */
+                params.lora_steps = -1;
+                break;
+            case OPT_SAMPLER:
+                if (strcmp(optarg, "euler") && strcmp(optarg, "ab2") &&
+                    strcmp(optarg, "heun") && strcmp(optarg, "renoise")) {
+                    fprintf(stderr,
+                            "h3: --sampler must be euler, ab2, heun or renoise\n");
+                    return 2;
+                }
+                setenv("H3_SAMPLER", optarg, 1);
+                break;
+            case OPT_SHIFT:
+                if (!set_shift_env(optarg, "shift", "H3_SIGMA_SHIFT"))
+                    return 2;
+                break;
+            case OPT_VIDEO_SHIFT:
+                if (!set_shift_env(optarg, "video-shift", "H3_SIGMA_SHIFT"))
+                    return 2;
+                break;
+            case OPT_KNOTS:
+                if (!set_knots_env(optarg)) return 2;
+                break;
+            case OPT_DUMP_LATENT:
+                params.dump_latent = optarg;
+                break;
+            case OPT_INIT_LATENT:
+                params.init_latent = optarg;
+                break;
+            case OPT_REFINE_PIXELS:
+                params.refine_pixels = 1;
+                break;
+            case OPT_LIFT_RHO:
+                params.lift_rho = parse_scale(optarg, "lift-rho");
+                break;
+            case OPT_LIFT_WMIN:
+                params.lift_wmin = parse_scale(optarg, "lift-wmin");
+                break;
+            case OPT_LIFT_WMAX:
+                params.lift_wmax = parse_scale(optarg, "lift-wmax");
+                break;
+            case OPT_OVERSIZE:
+                /* Opt into a canvas beyond the released 768p ceiling: up to
+                 * four times its pixel count, which covers 1080p and 2K. */
+                setenv("H3_CANVAS_LIMIT", "4128768", 1);
+                break;
+            case OPT_AUDIO_FROZEN:
+                setenv("H3_AUDIO_FROZEN", "1", 1);
+                break;
+            case OPT_AUDIO_SHIFT:
+                if (!set_shift_env(optarg, "audio-shift", "H3_AUDIO_SHIFT"))
+                    return 2;
+                break;
             case OPT_REUSE:
                 params.denoise_reuse = parse_int(optarg, "reuse");
                 break;
@@ -394,6 +541,24 @@ int main(int argc, char **argv) {
             case OPT_SEED:
                 params.seed = parse_u64(optarg, "seed");
                 seed_given = 1;
+                break;
+            case OPT_LORA:
+                params.lora_path = optarg;
+                break;
+            case OPT_LORA_SCALE:
+                params.lora_scale = parse_scale(optarg, "lora scale");
+                break;
+            case OPT_LORA_STEPS: {
+                int steps = parse_int(optarg, "lora steps");
+                if (steps < 2) {
+                    fprintf(stderr, "h3: --lora-steps must be at least 2\n");
+                    return 2;
+                }
+                params.lora_steps = steps;
+                break;
+            }
+            case OPT_LORA_SHIFT:
+                params.lora_shift = parse_shift(optarg, "lora shift");
                 break;
             case OPT_FIRST: params.first_frame = optarg; break;
             case OPT_LAST: params.last_frame = optarg; break;

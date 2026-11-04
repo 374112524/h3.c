@@ -83,6 +83,10 @@ typedef struct {
     int steps;
     float video[H3_MAX_STEPS + 1];
     float audio[H3_MAX_STEPS + 1];
+    /* Flow shifts that produced the grid. Step-acceleration LoRAs are often
+     * trained with a different shift than the released checkpoint. */
+    float video_shift;
+    float audio_shift;
 } h3_sigma_schedule;
 
 typedef struct {

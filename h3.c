@@ -188,6 +188,16 @@ static char *h3_prepared_key(const char *conditioning,
         free(key.text);
         return NULL;
     }
+    if (params->lora_path &&
+        (!h3_key_file(&key, "lora", params->lora_path) ||
+         !h3_key_append(&key, "|lora-scale=%.6g", params->lora_scale))) {
+        free(key.text);
+        return NULL;
+    }
+    if (!h3_structure_key(&key)) {
+        free(key.text);
+        return NULL;
+    }
     return key.text;
 }
 
@@ -567,8 +577,65 @@ static int h3_valid_params(h3_ctx *ctx, const h3_params *params) {
         h3_set_error(ctx, "denoising preview must be zero or one");
         return 0;
     }
+    if (params->lora_path && !*params->lora_path) {
+        h3_set_error(ctx, "the LoRA checkpoint path is empty");
+        return 0;
+    }
+    if (!(params->lora_scale > 0.0f) || params->lora_scale > 8.0f) {
+        h3_set_error(ctx, "the LoRA scale must be greater than zero and at "
+                         "most 8");
+        return 0;
+    }
+    if (params->lora_steps > H3_MAX_STEPS || params->lora_steps < -1) {
+        h3_set_error(ctx, "the LoRA step count must be in [-1, %d]",
+                     H3_MAX_STEPS);
+        return 0;
+    }
+    if (params->lora_steps > 0 && params->lora_steps < 2) {
+        h3_set_error(ctx, "the LoRA step count must be at least 2");
+        return 0;
+    }
+    if (params->lora_shift < 0.0f || params->lora_shift > 100.0f) {
+        h3_set_error(ctx, "the LoRA flow shift must be in [0, 100]");
+        return 0;
+    }
     if (params->preview_denoise && !params->on_frame) {
         h3_set_error(ctx, "denoising preview requires a frame callback");
+        return 0;
+    }
+    /* Reject an impossible two-pass request before any weight is loaded: the
+     * second pass only makes sense against a readable dump, and freezing the
+     * audio with nothing to carry would leave it as pure noise. */
+    const char *frozen_audio = getenv("H3_AUDIO_FROZEN");
+    int audio_frozen = frozen_audio && *frozen_audio &&
+        strcmp(frozen_audio, "0");
+    if (params->dump_latent && !*params->dump_latent) {
+        h3_set_error(ctx, "the latent dump path is empty");
+        return 0;
+    }
+    if (params->init_latent) {
+        struct stat latent_status;
+        if (!*params->init_latent) {
+            h3_set_error(ctx, "the init latent path is empty");
+            return 0;
+        }
+        if (stat(params->init_latent, &latent_status) != 0) {
+            h3_set_error(ctx, "cannot read the dumped latent: %s",
+                         params->init_latent);
+            return 0;
+        }
+        if ((size_t)latent_status.st_size < H3_LATENT_HEADER_BYTES) {
+            h3_set_error(ctx, "%s is too small to be a latent dump",
+                         params->init_latent);
+            return 0;
+        }
+    } else if (params->refine_pixels) {
+        h3_set_error(ctx, "--refine-pixels needs --init-latent to round-trip");
+        return 0;
+    }
+    if (audio_frozen && !(params->init_latent && *params->init_latent)) {
+        h3_set_error(ctx, "H3_AUDIO_FROZEN needs --init-latent to carry; "
+                     "otherwise the audio stream would stay noise");
         return 0;
     }
     if (params->core_reuse > 1 && params->denoise_reuse > 1) {
@@ -869,6 +936,101 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
         return NULL;
     }
     h3_generation_progress progress = {ctx, params, 0};
+    h3_lora *lora = NULL;
+    int steps = params->steps;
+    float lora_shift = params->lora_shift;
+    if (params->lora_path) {
+        lora = h3_lora_load(params->lora_path, params->lora_scale, ctx->error,
+                            sizeof(ctx->error));
+        if (!lora) {
+            h3_set_error(ctx, "%s", ctx->error);
+            return NULL;
+        }
+        fprintf(stderr,
+                "h3: LoRA %s: %zu adapters, alpha %.4g, scale %.4g\n",
+                params->lora_path, h3_lora_adapter_count(lora),
+                h3_lora_alpha(lora), h3_lora_scale(lora));
+        if (params->lora_steps > 0) {
+            steps = params->lora_steps;
+        } else if (params->lora_steps == 0) {
+            int recommended = h3_lora_recommended_steps(lora);
+            if (recommended >= 2) {
+                steps = recommended;
+                fprintf(stderr,
+                        "h3: LoRA requests %d denoising steps\n", steps);
+            }
+        }
+        if (!(lora_shift > 0.0f)) {
+            lora_shift = h3_lora_recommended_shift(lora);
+            if (lora_shift > 0.0f)
+                fprintf(stderr, "h3: LoRA requests a %.4g flow shift\n",
+                        lora_shift);
+        }
+        if (steps < minimum_steps || steps > H3_MAX_STEPS) {
+            h3_lora_free(lora);
+            h3_set_error(ctx, "the LoRA step count must be in [%d, %d]",
+                         minimum_steps, H3_MAX_STEPS);
+            return NULL;
+        }
+    }
+    /* Resolve the flow shifts and the sampler before the prepared key so a
+     * cached DiT can never be reused with a different schedule or sampler. */
+    float schedule_shift = lora_shift;
+    const char *shift_env = getenv("H3_SIGMA_SHIFT");
+    if (shift_env && *shift_env) {
+        char *end = NULL;
+        float parsed_shift = strtof(shift_env, &end);
+        if (end != shift_env && (!*end || !strcmp(end, "f")) &&
+            parsed_shift > 0.5f && parsed_shift < 100.0f)
+            schedule_shift = parsed_shift;
+    }
+    /* Zero leaves the released audio shift in place. */
+    float audio_schedule_shift = 0.0f;
+    const char *audio_shift_env = getenv("H3_AUDIO_SHIFT");
+    if (audio_shift_env && *audio_shift_env) {
+        char *end = NULL;
+        float parsed_shift = strtof(audio_shift_env, &end);
+        if (end != audio_shift_env && (!*end || !strcmp(end, "f")) &&
+            parsed_shift > 0.5f && parsed_shift < 100.0f)
+            audio_schedule_shift = parsed_shift;
+    }
+    const char *sampler_env = getenv("H3_SAMPLER");
+    const char *sampler = sampler_env && !strcmp(sampler_env, "ab2") ? "ab2" :
+        sampler_env && !strcmp(sampler_env, "heun") ? "heun" :
+        sampler_env && !strcmp(sampler_env, "renoise") ? "renoise" : "euler";
+    /* An explicit knot grid replaces the released linear base grid. Adapters
+     * that ship a schedule state that generic sampling at the same step count
+     * is not equivalent, so the grid is validated against the final count. */
+    float knot_grid[H3_MAX_STEPS + 1];
+    int has_knots = 0;
+    const char *knots_env = getenv("H3_SIGMA_KNOTS");
+    if (knots_env && *knots_env) {
+        if (!h3_schedule_parse_knots(knots_env, steps, knot_grid,
+                                     sizeof(knot_grid) /
+                                         sizeof(knot_grid[0]))) {
+            h3_lora_free(lora);
+            h3_set_error(ctx,
+                         "H3_SIGMA_KNOTS must be %d strictly descending "
+                         "timesteps from 1000 down to 0, got: %s",
+                         steps + 1, knots_env);
+            return NULL;
+        }
+        has_knots = 1;
+        fprintf(stderr, "h3: sampling %d steps on the knot grid %s\n",
+                steps, knots_env);
+        if (knot_grid[0] != 1000.0f && !params->init_latent) {
+            h3_lora_free(lora);
+            h3_set_error(ctx, "a knot grid starting below 1000 needs "
+                         "--init-latent to re-noise, got: %s", knots_env);
+            return NULL;
+        }
+        if (knot_grid[steps] != 0.0f && !params->dump_latent) {
+            h3_lora_free(lora);
+            h3_set_error(ctx, "a knot grid stopping above zero is a partial "
+                         "pass and needs --dump-latent to hand the sample on");
+            return NULL;
+        }
+    }
     h3_temporal_shape temporal = h3_temporal(params->frames);
     int latent_w, latent_h;
     h3_latent_canvas(render_width, render_height, &latent_w, &latent_h);
@@ -1475,8 +1637,10 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
         }
         fprintf(stderr, "h3: prepared DiT cache hit\n");
     } else if (conditioned) {
+        h3_lora *owned = lora;
+        lora = NULL;
         dit = h3_dit_load_conditioned(
-            dit_path, "h3_shaders.metal", &text, &layout, &sigmas,
+            dit_path, "h3_shaders.metal", &text, &layout, &sigmas, owned,
             (unsigned)params->dit_layers, (unsigned)params->core_reuse,
             params->token_reduction,
             params->ssd_streaming,
@@ -1496,8 +1660,10 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
             condition_audio_rows, condition_audio_elements,
             h3_dit_progress_bridge, &progress, detail, sizeof(detail));
     } else {
+        h3_lora *owned = lora;
+        lora = NULL;
         dit = h3_dit_load_t2va(
-            dit_path, "h3_shaders.metal", &text, &layout, &sigmas,
+            dit_path, "h3_shaders.metal", &text, &layout, &sigmas, owned,
             (unsigned)params->dit_layers, (unsigned)params->core_reuse,
             params->token_reduction,
             params->ssd_streaming,
@@ -1690,6 +1856,7 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
     result->seed = params->seed;
 
 cleanup:
+    h3_lora_free(lora);
     free(conditioning_key);
     free(prepared_key);
     free(decoder_key);

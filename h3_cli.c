@@ -29,6 +29,7 @@ typedef struct {
     h3_reference references[12];
     char *first_frame;
     char *last_frame;
+    char *lora;
     char output_dir[H3_CLI_PATH];
     char last_output[H3_CLI_PATH];
     char *last_prompt;
@@ -151,6 +152,10 @@ static void print_help(void) {
     puts("  !help                    Show this help");
     puts("  !status                  Show current settings");
     puts("  !seed [N|random]         Set or show the seed");
+    puts("  !lora [PATH|clear]       Set, show, or clear the style LoRA");
+    puts("  !lora-scale [N]          Set or show the LoRA strength");
+    puts("  !lora-steps [N]          Set or show the LoRA step count");
+    puts("  !lora-shift [N]          Set or show the LoRA flow shift");
     puts("  !size [WxH]              Set or show output size");
     puts("  !render-size [WxH|native]  Set internal render size");
     puts("  !frames [N]              Set or show requested frames");
@@ -201,6 +206,9 @@ static void print_status(const h3_cli_state *state) {
     if (state->random_seed) puts("Seed: random");
     else printf("Seed: %" PRIu64 "\n", state->params.seed);
     printf("First: %s\n", state->first_frame ? state->first_frame : "none");
+    printf("LoRA: %s (scale %.4g, steps %d, shift %.4g)\n",
+           state->lora ? state->lora : "none", state->params.lora_scale,
+           state->params.lora_steps, state->params.lora_shift);
     printf("Last: %s\n", state->last_frame ? state->last_frame : "none");
     printf("References: %zu%s\n", state->params.reference_count,
            state->params.reference_count ? " (use !refs to list)" : "");
@@ -513,6 +521,79 @@ static int process_command(h3_cli_state *state, char *line, int *repeat) {
                 printf("Seed: %" PRIu64 "\n", value);
             }
         }
+    } else if (!strcasecmp(command, "lora")) {
+        argument = skip_spaces(argument);
+        if (!*argument) {
+            printf("LoRA: %s (scale %.4g)\n", state->lora ? state->lora :
+                   "none", state->params.lora_scale);
+        } else if (!strcasecmp(argument, "clear")) {
+            free(state->lora);
+            state->lora = NULL;
+            state->params.lora_path = NULL;
+            h3_cache_clear(state->ctx);
+            puts("LoRA: none");
+        } else {
+            char *copy = strdup(argument);
+            if (!copy) {
+                fprintf(stderr, "h3: out of memory copying the LoRA path\n");
+            } else {
+                free(state->lora);
+                state->lora = copy;
+                state->params.lora_path = state->lora;
+                h3_cache_clear(state->ctx);
+                printf("LoRA: %s\n", state->lora);
+            }
+        }
+    } else if (!strcasecmp(command, "lora-scale")) {
+        argument = skip_spaces(argument);
+        if (!*argument) {
+            printf("LoRA scale: %.4g\n", state->params.lora_scale);
+        } else {
+            char *end = NULL;
+            errno = 0;
+            double value = strtod(argument, &end);
+            while (end && isspace((unsigned char)*end)) end++;
+            if (errno || !end || end == argument || !end || *end ||
+                !isfinite(value) || value <= 0.0 || value > 8.0) {
+                fprintf(stderr, "h3: invalid LoRA scale\n");
+            } else {
+                state->params.lora_scale = (float)value;
+                h3_cache_clear(state->ctx);
+                printf("LoRA scale: %.4g\n", state->params.lora_scale);
+            }
+        }
+    } else if (!strcasecmp(command, "lora-steps")) {
+        argument = skip_spaces(argument);
+        if (!*argument) {
+            printf("LoRA steps: %d\n", state->params.lora_steps);
+        } else {
+            int value;
+            if (!parse_i32(argument, 0, 1000, &value)) {
+                fprintf(stderr, "h3: invalid LoRA step count\n");
+            } else {
+                state->params.lora_steps = value;
+                h3_cache_clear(state->ctx);
+                printf("LoRA steps: %d\n", value);
+            }
+        }
+    } else if (!strcasecmp(command, "lora-shift")) {
+        argument = skip_spaces(argument);
+        if (!*argument) {
+            printf("LoRA shift: %.4g\n", state->params.lora_shift);
+        } else {
+            char *end = NULL;
+            errno = 0;
+            double value = strtod(argument, &end);
+            while (end && isspace((unsigned char)*end)) end++;
+            if (errno || !end || end == argument || !end || *end ||
+                !isfinite(value) || value < 0.0 || value > 100.0) {
+                fprintf(stderr, "h3: invalid LoRA flow shift\n");
+            } else {
+                state->params.lora_shift = (float)value;
+                h3_cache_clear(state->ctx);
+                printf("LoRA shift: %.4g\n", state->params.lora_shift);
+            }
+        }
     } else if (!strcasecmp(command, "size")) {
         if (!*argument) printf("Size: %dx%d\n", state->params.width,
                                state->params.height);
@@ -570,6 +651,8 @@ static int process_command(h3_cli_state *state, char *line, int *repeat) {
         }
     } else if (!strcasecmp(command, "steps")) {
         set_integer(argument, "Steps", 1, H3_MAX_STEPS, &state->params.steps);
+        /* An explicit step count wins over the LoRA recommendation. */
+        state->params.lora_steps = -1;
     } else if (!strcasecmp(command, "reuse")) {
         set_integer(argument, "Reuse", 1, 32, &state->params.denoise_reuse);
     } else if (!strcasecmp(command, "layers")) {
@@ -712,13 +795,17 @@ int h3_cli_run(h3_ctx *ctx, const char *model_dir,
     state.show = show && state.terminal != H3_TERM_NONE;
     if (initial->first_frame) state.first_frame = strdup(initial->first_frame);
     if (initial->last_frame) state.last_frame = strdup(initial->last_frame);
+    if (initial->lora_path) state.lora = strdup(initial->lora_path);
+    state.params.lora_path = state.lora;
     if ((initial->first_frame && !state.first_frame) ||
         (initial->last_frame && !state.last_frame) ||
+        (initial->lora_path && !state.lora) ||
         initial_reference_count > 12 ||
         (initial_reference_count && !initial_references)) {
         fprintf(stderr, "h3: cannot copy initial interactive inputs\n");
         free(state.first_frame);
         free(state.last_frame);
+        free(state.lora);
         return 1;
     }
     for (size_t index = 0; index < initial_reference_count; index++) {
@@ -786,6 +873,7 @@ int h3_cli_run(h3_ctx *ctx, const char *model_dir,
     if (*history) linenoiseHistorySave(history);
     free(state.first_frame);
     free(state.last_frame);
+    free(state.lora);
     free(state.last_prompt);
     clear_references(&state);
     puts("Goodbye.");
