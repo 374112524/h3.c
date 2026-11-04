@@ -164,10 +164,21 @@ static char *h3_conditioning_key(const char *prompt, const h3_params *params,
     if (!h3_key_append(&key, "mode=%d|prompt=%zu:%s", ref2va,
                        strlen(prompt), prompt)) goto failed;
     if (!ref2va && !params->first_frame && !params->last_frame) return key.text;
-    if (!h3_key_append(&key, "|render=%dx%d|frames=%d|image-size=%d",
+    /* The conditioning depends on the canvas only through the size each
+     * reference is resampled to, and h3_reference_image_canvas clamps that to
+     * the source when the source is smaller than the target area. With such
+     * refs the encoder outputs are byte-identical across canvases - verified -
+     * so this opt-in lets one pass carry them to another. A conditioning that
+     * does not fit the new canvas is still caught by the packing-size check. */
+    const char *carry = getenv("H3_COND_CARRY_ACROSS_CANVAS");
+    int carry_across = carry && *carry && strcmp(carry, "0");
+    if (carry_across) {
+        if (!h3_key_append(&key, "|image-size=%d",
+                           params->reference_image_size)) goto failed;
+    } else if (!h3_key_append(&key, "|render=%dx%d|frames=%d|image-size=%d",
                        render_width, render_height, params->frames,
-                       params->reference_image_size) ||
-        !h3_key_file(&key, "first", params->first_frame) ||
+                       params->reference_image_size)) goto failed;
+    if (!h3_key_file(&key, "first", params->first_frame) ||
         !h3_key_file(&key, "last", params->last_frame)) goto failed;
     for (size_t index = 0; index < params->reference_count; index++) {
         const h3_reference *reference = &params->references[index];
@@ -305,6 +316,37 @@ static int h3_conditioning_cache_store(
     return 1;
 }
 
+/* Publish one conditioning set as the current entry, taking ownership of the
+ * three row buffers. Shared by the in-process store above and the disk restore
+ * below so the two paths cannot drift apart. */
+static int h3_conditioning_adopt(h3_ctx *ctx, char *key_copy,
+                                 const h3_text_embedding *text, float *video,
+                                 size_t video_elements, float *audio,
+                                 size_t audio_elements,
+                                 h3_layout_ref *references,
+                                 size_t reference_count, int conditioned) {
+    h3_text_embedding copy;
+    if (!key_copy || !h3_text_embedding_copy(&copy, text)) {
+        free(key_copy);
+        free(video); free(audio); free(references);
+        return 0;
+    }
+    h3_conditioning_cache_clear(ctx);
+    ctx->conditioning_key = key_copy;
+    ctx->conditioning_tokens = copy.tokens;
+    ctx->conditioning_width = copy.width;
+    ctx->conditioning_values = copy.values;
+    ctx->conditioning_tags = copy.tags;
+    ctx->conditioning_video_rows = video;
+    ctx->conditioning_video_elements = video_elements;
+    ctx->conditioning_audio_rows = audio;
+    ctx->conditioning_audio_elements = audio_elements;
+    ctx->conditioning_references = references;
+    ctx->conditioning_reference_count = reference_count;
+    ctx->conditioning_present = conditioned;
+    return 1;
+}
+
 static int h3_conditioning_cache_load(
         const h3_ctx *ctx, h3_text_embedding *text,
         float **video, size_t *video_elements,
@@ -345,6 +387,248 @@ static int h3_conditioning_cache_load(
         return 0;
     }
     return 1;
+}
+
+/* The encoder outputs depend on the prompt, the reference media and the render
+ * canvas, not on which pass they are used in, so a second process can read them
+ * instead of running the Qwen text encoder, the vision encoder and the
+ * reference-image video VAE encode again: measured 74 s of a 1344x768 tail.
+ * Reads happen whenever H3_COND_CACHE names a directory; filling it stays
+ * opt-in through H3_COND_CACHE_WRITE so no run silently writes to disk. */
+#define H3_COND_MAGIC 0x4E434F31u /* "1OCN" */
+#define H3_COND_VERSION 1u
+#define H3_COND_CACHE_ENV "H3_COND_CACHE"
+#define H3_COND_WRITE_ENV "H3_COND_CACHE_WRITE"
+#define H3_COND_FILE "conditioning.bin"
+
+typedef struct {
+    uint32_t magic;
+    uint32_t version;
+    uint64_t tokens;
+    uint64_t width;
+    uint64_t video_elements;
+    uint64_t audio_elements;
+    uint64_t reference_count;
+    uint32_t conditioned;
+    uint32_t tags_present;
+} h3_cond_header;
+
+_Static_assert(sizeof(h3_cond_header) == 56,
+               "the conditioning cache header layout is fixed");
+
+static int h3_conditioning_read(FILE *stream, void *buffer, size_t elements,
+                                size_t element_size) {
+    if (!elements) return 1;
+    return buffer && fread(buffer, element_size, elements, stream) == elements;
+}
+
+/* A fingerprint of one conditioning set, so a disk round trip can be proven
+ * faithful and two fresh encodings can be compared without trusting the
+ * sampler, which is not reproducible across runs at these settings. */
+/* One range of the conditioning, so a run-to-run difference names the encoder
+ * that produced it instead of only proving something moved. */
+static uint64_t h3_conditioning_hash_bytes(uint64_t hash, const void *data,
+                                           size_t size) {
+    const unsigned char *bytes = data;
+    for (size_t index = 0; index < size; index++) {
+        hash ^= bytes ? bytes[index] : 0u;
+        hash *= UINT64_C(1099511628211);
+    }
+    return hash;
+}
+
+static uint64_t h3_conditioning_fingerprint_part(const h3_ctx *ctx, int part) {
+    uint64_t hash = UINT64_C(1469598103934665603);
+    switch (part) {
+    case 0: /* Qwen text encoder output */
+        return h3_conditioning_hash_bytes(hash, ctx->conditioning_values,
+            ctx->conditioning_tokens * ctx->conditioning_width *
+            sizeof(*ctx->conditioning_values));
+    case 1: /* reference-image video VAE encoder output */
+        return h3_conditioning_hash_bytes(hash, ctx->conditioning_video_rows,
+            ctx->conditioning_video_elements *
+            sizeof(*ctx->conditioning_video_rows));
+    case 2: /* audio reference conditioning */
+        return h3_conditioning_hash_bytes(hash, ctx->conditioning_audio_rows,
+            ctx->conditioning_audio_elements *
+            sizeof(*ctx->conditioning_audio_rows));
+    default: /* tags and layout, both host-side */
+        hash = h3_conditioning_hash_bytes(hash, ctx->conditioning_tags,
+            ctx->conditioning_tokens * sizeof(*ctx->conditioning_tags));
+        return h3_conditioning_hash_bytes(hash, ctx->conditioning_references,
+            ctx->conditioning_reference_count *
+            sizeof(*ctx->conditioning_references));
+    }
+}
+
+static uint64_t h3_conditioning_fingerprint(const h3_ctx *ctx) {
+    uint64_t hash = UINT64_C(1469598103934665603);
+    const unsigned char *bytes;
+    size_t count;
+#define H3_COND_FEED(name, elements, element_size) do {                         \
+    count = (elements) * (element_size);                                        \
+    bytes = (const unsigned char *)(name);                                      \
+    for (size_t index = 0; index < count; index++) {                            \
+        hash ^= bytes ? bytes[index] : 0u;                                      \
+        hash *= UINT64_C(1099511628211);                                        \
+    }                                                                           \
+} while (0)
+    H3_COND_FEED(ctx->conditioning_values,
+                 ctx->conditioning_tokens * ctx->conditioning_width,
+                 sizeof(*ctx->conditioning_values));
+    H3_COND_FEED(ctx->conditioning_tags, ctx->conditioning_tokens,
+                 sizeof(*ctx->conditioning_tags));
+    H3_COND_FEED(ctx->conditioning_video_rows,
+                 ctx->conditioning_video_elements,
+                 sizeof(*ctx->conditioning_video_rows));
+    H3_COND_FEED(ctx->conditioning_audio_rows,
+                 ctx->conditioning_audio_elements,
+                 sizeof(*ctx->conditioning_audio_rows));
+    H3_COND_FEED(ctx->conditioning_references,
+                 ctx->conditioning_reference_count,
+                 sizeof(*ctx->conditioning_references));
+#undef H3_COND_FEED
+    return hash;
+}
+
+static int h3_conditioning_write(FILE *stream, const void *buffer,
+                                 size_t elements, size_t element_size) {
+    if (!elements) return 1;
+    return buffer && fwrite(buffer, element_size, elements, stream) == elements;
+}
+
+static int h3_conditioning_file(const char *identity, char *path, size_t size) {
+    char directory[640];
+    if (!identity || !*identity ||
+        !h3_cache_directory_text(H3_COND_CACHE_ENV, "h3-cond-v1|", identity,
+                                 directory, sizeof(directory)) ||
+        !h3_cache_path(directory, H3_COND_FILE, path, size)) return 0;
+    return 1;
+}
+
+static int h3_conditioning_disk_restore(h3_ctx *ctx, const char *identity,
+                                        char *error, size_t error_size) {
+    char path[832];
+    if (!h3_conditioning_file(identity, path, sizeof(path))) return 0;
+    FILE *stream = fopen(path, "rb");
+    if (!stream) return 0;
+    h3_cond_header header;
+    int ok = fread(&header, sizeof(header), 1, stream) == 1 &&
+        header.magic == H3_COND_MAGIC && header.version == H3_COND_VERSION &&
+        header.tokens && header.width &&
+        header.tokens <= SIZE_MAX / header.width / sizeof(uint16_t);
+    uint16_t *values = ok ? malloc(header.tokens * header.width *
+                                   sizeof(*values)) : NULL;
+    uint8_t *tags = ok && header.tags_present ?
+        malloc(header.tokens * sizeof(*tags)) : NULL;
+    float *video = ok && header.video_elements ?
+        malloc(header.video_elements * sizeof(*video)) : NULL;
+    float *audio = ok && header.audio_elements ?
+        malloc(header.audio_elements * sizeof(*audio)) : NULL;
+    h3_layout_ref *references = ok && header.reference_count ?
+        malloc(header.reference_count * sizeof(*references)) : NULL;
+    ok = ok && values &&
+        (!header.tags_present || tags) &&
+        (!header.video_elements || video) &&
+        (!header.audio_elements || audio) &&
+        (!header.reference_count || references) &&
+        h3_conditioning_read(stream, values,
+            header.tokens * header.width, sizeof(*values)) &&
+        h3_conditioning_read(stream, tags,
+            header.tags_present ? header.tokens : 0, sizeof(*tags)) &&
+        h3_conditioning_read(stream, video, header.video_elements,
+                             sizeof(*video)) &&
+        h3_conditioning_read(stream, audio, header.audio_elements,
+                             sizeof(*audio)) &&
+        h3_conditioning_read(stream, references, header.reference_count,
+                             sizeof(*references));
+    fclose(stream);
+    if (!ok) {
+        free(values); free(tags); free(video); free(audio); free(references);
+        if (error && error_size)
+            snprintf(error, error_size,
+                     "the conditioning cache in %s is unreadable; ignoring it",
+                     path);
+        return 0;
+    }
+    h3_text_embedding text = { (size_t)header.tokens, (size_t)header.width,
+                               values, {0}, tags };
+    /* adopt copies the embedding, so the buffers read here are transient. */
+    if (!h3_conditioning_adopt(ctx, strdup(identity), &text, video,
+                               (size_t)header.video_elements, audio,
+                               (size_t)header.audio_elements, references,
+                               (size_t)header.reference_count,
+                               (int)header.conditioned)) {
+        free(values); free(tags);
+        return 0;
+    }
+    free(values); free(tags);
+    fprintf(stderr, "h3: conditioning restored from the disk cache "
+            "(%zu tokens, %zu video rows, %zu audio rows, fingerprint %016llx)\n",
+            (size_t)header.tokens, (size_t)header.video_elements,
+            (size_t)header.audio_elements,
+            (unsigned long long)h3_conditioning_fingerprint(ctx));
+    return 1;
+}
+
+static void h3_conditioning_disk_store(const h3_ctx *ctx) {
+    if (!h3_cache_env_flag(H3_COND_WRITE_ENV) || !ctx->conditioning_key ||
+        !ctx->conditioning_values || !ctx->conditioning_tokens) return;
+    char directory[640], path[832], temporary[848], reason[256] = "";
+    if (!h3_cache_directory_text(H3_COND_CACHE_ENV, "h3-cond-v1|",
+                                 ctx->conditioning_key, directory,
+                                 sizeof(directory)) ||
+        !h3_cache_prepare(directory, reason, sizeof(reason)) ||
+        !h3_cache_path(directory, H3_COND_FILE, path, sizeof(path)) ||
+        snprintf(temporary, sizeof(temporary), "%s.tmp", path) >=
+            (int)sizeof(temporary)) {
+        /* Never fail quietly: a silently unwritten cache reads back as "the
+         * cache does not help" and sends the next reader chasing a speed
+         * problem that is really a missing directory. */
+        fprintf(stderr, "h3: warning: conditioning was not written to the disk "
+                "cache: %s\n", *reason ? reason : "cache path unavailable");
+        return;
+    }
+    h3_cond_header header = {
+        H3_COND_MAGIC, H3_COND_VERSION,
+        (uint64_t)ctx->conditioning_tokens, (uint64_t)ctx->conditioning_width,
+        (uint64_t)ctx->conditioning_video_elements,
+        (uint64_t)ctx->conditioning_audio_elements,
+        (uint64_t)ctx->conditioning_reference_count,
+        (uint32_t)(ctx->conditioning_present ? 1 : 0),
+        (uint32_t)(ctx->conditioning_tags ? 1 : 0)
+    };
+    FILE *stream = fopen(temporary, "wb");
+    if (!stream) return;
+    int ok = fwrite(&header, sizeof(header), 1, stream) == 1 &&
+        h3_conditioning_write(stream, ctx->conditioning_values,
+            ctx->conditioning_tokens * ctx->conditioning_width,
+            sizeof(*ctx->conditioning_values)) &&
+        h3_conditioning_write(stream, ctx->conditioning_tags,
+            header.tags_present ? ctx->conditioning_tokens : 0,
+            sizeof(*ctx->conditioning_tags)) &&
+        h3_conditioning_write(stream, ctx->conditioning_video_rows,
+            ctx->conditioning_video_elements,
+            sizeof(*ctx->conditioning_video_rows)) &&
+        h3_conditioning_write(stream, ctx->conditioning_audio_rows,
+            ctx->conditioning_audio_elements,
+            sizeof(*ctx->conditioning_audio_rows)) &&
+        h3_conditioning_write(stream, ctx->conditioning_references,
+            ctx->conditioning_reference_count,
+            sizeof(*ctx->conditioning_references));
+    if (fclose(stream) != 0) ok = 0;
+    if (ok && rename(temporary, path) == 0) {
+        fprintf(stderr, "h3: conditioning written to the disk cache "
+                "(fingerprint %016llx | text %016llx refs %016llx audio "
+                "%016llx meta %016llx)\n",
+                (unsigned long long)h3_conditioning_fingerprint(ctx),
+                (unsigned long long)h3_conditioning_fingerprint_part(ctx, 0),
+                (unsigned long long)h3_conditioning_fingerprint_part(ctx, 1),
+                (unsigned long long)h3_conditioning_fingerprint_part(ctx, 2),
+                (unsigned long long)h3_conditioning_fingerprint_part(ctx, 3));
+        return;
+    }
+    remove(temporary);
 }
 
 static void h3_augment_span(float *values, size_t count, uint64_t seed) {
@@ -1159,6 +1443,16 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
     }
     conditioning_hit = ctx->cache_enabled && ctx->conditioning_key &&
         !strcmp(ctx->conditioning_key, conditioning_key);
+    /* A fresh process has no in-memory entry, so fall back to the persisted
+     * encoder outputs before paying for the text encoder, the vision encoder
+     * and the reference-image video VAE encode again. */
+    if (!conditioning_hit && ctx->cache_enabled) {
+        char disk_note[512] = "";
+        conditioning_hit = h3_conditioning_disk_restore(
+            ctx, conditioning_key, disk_note, sizeof(disk_note));
+        if (conditioning_hit && *disk_note)
+            fprintf(stderr, "h3: warning: %s\n", disk_note);
+    }
     char detail[512];
     if (conditioning_hit) {
         size_t cached_reference_count = 0;
@@ -1626,6 +1920,7 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
             fprintf(stderr, "h3: warning: could not retain conditioning cache\n");
         else
             fprintf(stderr, "h3: conditioning cache miss; stored exact BF16\n");
+        h3_conditioning_disk_store(ctx);
     }
     }
     if (conditioned && !h3_augment_conditions(
