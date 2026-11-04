@@ -137,6 +137,7 @@ test: h3_tests h3_metal_tests h3_bf16_tests h3_tokenizer_tests h3_text_tests \
 		echo "skip: MLX Qwen fixture is not installed"; \
 	fi
 	./h3_audio_gpu_tests
+	./h3_weight_round_tests
 	@if test -f MiniMax-H3/FL2VA/audio_vae/model.safetensors && \
 	         test -f misc/fixtures/h3_real_audio_vae_37.safetensors; then \
 		./h3_real_audio_vae_test; \

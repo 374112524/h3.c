@@ -1,4 +1,5 @@
 #include "h3_dit_schedule.h"
+#include "h3_cache.h"
 
 #include <math.h>
 #include <stdarg.h>
@@ -234,6 +235,124 @@ cleanup:
     return result;
 }
 
+/* ---- Materialized AdaLN cache -----------------------------------------
+ * The per-step tables are pure functions of the AdaLN weights and the sigma
+ * grid. Materializing them reads ~26 GiB of shards and runs 50 projections,
+ * so persisting them turns that into a ~135 MB read. The bytes written are
+ * read back from the same tensors the kernels consume, so a hit cannot change
+ * the result. */
+enum {
+    ADALN_CACHE_MAGIC = 0x4e4c4441u, /* "ADLN" */
+    ADALN_CACHE_VERSION = 1u
+};
+
+typedef struct {
+    uint32_t magic;
+    uint32_t version;
+    uint32_t blocks;
+    uint32_t time_rows;
+    uint32_t block_output;
+    uint32_t final_output;
+} adaln_cache_header;
+
+static int adaln_cache_read_table(FILE *file, h3_gpu *gpu, size_t elements,
+                                  h3_gpu_tensor **table) {
+    uint16_t *host = malloc(elements * sizeof(*host));
+    if (!host) return 0;
+    int ok = fread(host, sizeof(*host), elements, file) == elements;
+    h3_gpu_tensor *tensor = ok ? h3_gpu_tensor_new_bf16(gpu, elements) : NULL;
+    ok = ok && tensor && h3_gpu_tensor_write_bf16(tensor, host, elements);
+    free(host);
+    if (!ok) {
+        h3_gpu_tensor_free(tensor);
+        return 0;
+    }
+    *table = tensor;
+    return 1;
+}
+
+static int adaln_cache_restore(h3_dit_schedule *schedule, const char *path) {
+    FILE *file = fopen(path, "rb");
+    if (!file) return 0;
+    adaln_cache_header header;
+    int ok = fread(&header, sizeof(header), 1, file) == 1 &&
+        header.magic == ADALN_CACHE_MAGIC &&
+        header.version == ADALN_CACHE_VERSION &&
+        header.blocks == H3_DIT_BLOCKS &&
+        header.time_rows == schedule->time_rows &&
+        header.block_output == BLOCK_OUTPUT &&
+        header.final_output == FINAL_OUTPUT;
+    size_t block_elements = (size_t)schedule->time_rows * BLOCK_OUTPUT;
+    size_t final_elements = (size_t)schedule->time_rows * FINAL_OUTPUT;
+    for (unsigned block = 0; ok && block < H3_DIT_BLOCKS; block++)
+        ok = adaln_cache_read_table(file, schedule->gpu, block_elements,
+                                    &schedule->blocks[block]);
+    if (ok)
+        ok = adaln_cache_read_table(file, schedule->gpu, final_elements,
+                                    &schedule->final);
+    fclose(file);
+    if (!ok) {
+        for (unsigned block = 0; block < H3_DIT_BLOCKS; block++)
+            h3_gpu_tensor_free(schedule->blocks[block]);
+        h3_gpu_tensor_free(schedule->final);
+        return 0;
+    }
+    return 1;
+}
+
+static void adaln_cache_write_table(FILE *file, const h3_gpu_tensor *table,
+                                    size_t elements, int *ok) {
+    uint16_t *host = malloc(elements * sizeof(*host));
+    if (!host) {
+        *ok = 0;
+        return;
+    }
+    *ok = h3_gpu_tensor_read_bf16(table, host, elements) &&
+        fwrite(host, sizeof(*host), elements, file) == elements;
+    free(host);
+}
+
+static void adaln_cache_save(const h3_dit_schedule *schedule, const char *path) {
+    char temporary[640];
+    if (snprintf(temporary, sizeof(temporary), "%s.tmp", path) <= 0) return;
+    FILE *file = fopen(temporary, "wb");
+    if (!file) return;
+    adaln_cache_header header = {
+        ADALN_CACHE_MAGIC, ADALN_CACHE_VERSION, H3_DIT_BLOCKS,
+        schedule->time_rows, BLOCK_OUTPUT, FINAL_OUTPUT
+    };
+    int ok = fwrite(&header, sizeof(header), 1, file) == 1;
+    size_t block_elements = (size_t)schedule->time_rows * BLOCK_OUTPUT;
+    size_t final_elements = (size_t)schedule->time_rows * FINAL_OUTPUT;
+    for (unsigned block = 0; ok && block < H3_DIT_BLOCKS; block++)
+        adaln_cache_write_table(file, schedule->blocks[block], block_elements,
+                                &ok);
+    if (ok)
+        adaln_cache_write_table(file, schedule->final, final_elements, &ok);
+    if (fclose(file) != 0) ok = 0;
+    if (ok) {
+        if (rename(temporary, path) != 0) remove(temporary);
+    } else {
+        remove(temporary);
+    }
+    if (getenv("H3_PROFILE"))
+        fprintf(stderr, "h3: AdaLN cache %s %s\n",
+                ok ? "written to" : "write failed at", temporary);
+}
+
+/* Append one "|name=value" component to a cache variant. Returns 0 when the
+ * component would not fit, so the caller can refuse to use the cache instead
+ * of colliding with a schedule that produced different tables. */
+static int adaln_variant_append(char *variant, size_t capacity, size_t *length,
+                                const char *name, const char *value) {
+    if (!value || !*value) return 1;
+    int written = snprintf(variant + *length, capacity - *length, "|%s=%s",
+                           name, value);
+    if (written < 0 || (size_t)written >= capacity - *length) return 0;
+    *length += (size_t)written;
+    return 1;
+}
+
 h3_dit_schedule *h3_dit_schedule_precompute(
     const h3_weight_store *weights, h3_gpu *gpu,
     const h3_sigma_schedule *sigmas, int visual_condition,
@@ -255,6 +374,37 @@ h3_dit_schedule *h3_dit_schedule_precompute(
     float *features = NULL;
     if (!prepare_rows(schedule, sigmas, visual_condition, audio_condition,
                       &features, error, error_size)) goto failed;
+    char cache_variant[256], cache_dir[512], cache_path[608];
+    snprintf(cache_variant, sizeof(cache_variant),
+             "adaln|steps=%d|video=%.6g|audio=%.6g|rows=%u|vc=%d|ac=%d",
+             sigmas->steps, sigmas->video_shift, sigmas->audio_shift,
+             schedule->time_rows, visual_condition, audio_condition);
+    /* A knot grid or a frozen audio stream changes the timestep rows at the
+     * same step count, so both belong in the key. Runs without either keep the
+     * released variant string. Appending must never truncate: a collided
+     * variant would restore tables built for a different schedule. */
+    const char *frozen = getenv("H3_AUDIO_FROZEN");
+    if (frozen && !strcmp(frozen, "0")) frozen = NULL;
+    size_t variant_length = strlen(cache_variant);
+    int variant_complete =
+        adaln_variant_append(cache_variant, sizeof(cache_variant),
+                             &variant_length, "knots",
+                             getenv("H3_SIGMA_KNOTS")) &&
+        adaln_variant_append(cache_variant, sizeof(cache_variant),
+                             &variant_length, "afreeze", frozen);
+    int cache_ready = variant_complete &&
+        h3_cache_directory(weights, cache_variant, cache_dir,
+                           sizeof(cache_dir)) &&
+        h3_cache_path(cache_dir, "adaln.bin", cache_path,
+                      sizeof(cache_path));
+    if (cache_ready && adaln_cache_restore(schedule, cache_path)) {
+        free(features);
+        if (progress) progress((int)H3_DIT_BLOCKS, (int)H3_DIT_BLOCKS,
+                               progress_opaque);
+        if (getenv("H3_PROFILE"))
+            fprintf(stderr, "h3: AdaLN tables restored from cache\n");
+        return schedule;
+    }
     h3_gpu_tensor *time = time_embeddings(weights, gpu, schedule->time_rows,
                                            features, error, error_size);
     free(features);
@@ -328,6 +478,10 @@ h3_dit_schedule *h3_dit_schedule_precompute(
     free_tensor(&final_w);
     free_tensor(&final_b);
     h3_gpu_tensor_free(time);
+    /* Populating is opt-in on top of enabling the cache directory. */
+    if (cache_ready && h3_cache_writes_enabled() &&
+        h3_cache_prepare(cache_dir, NULL, 0))
+        adaln_cache_save(schedule, cache_path);
     return schedule;
 
 failed:

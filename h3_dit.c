@@ -1,5 +1,6 @@
 #include "h3_dit.h"
 
+#include "h3_cache.h"
 #include "h3_dit_schedule.h"
 #include "h3_weights.h"
 
@@ -2559,12 +2560,22 @@ static int encode_forward(h3_dit *dit, int step, int begin, int submit,
                     fused_attention_input_quantized = 0;
                 } else if (!leave_token_reduction(
                                dit, error, error_size)) return 0;
+                }
             }
             if (!dit->block_active[block]) continue;
             unsigned next_block = block + 1;
+            /* Attention-only merging must pool at the start of every reduced
+             * block, so no full-grid AdaLN may be fused into one. Pooling only
+             * keys/values keeps every AdaLN on the full grid and needs no
+             * boundary restriction. */
+            int token_mode = dit->token_reduction_attention_only;
             int next_is_token_boundary = use_token_reduction &&
-                (next_block == dit->token_reduction_begin ||
-                 next_block == token_reduction_end);
+                (token_mode == 2 ? 0 :
+                 token_mode == 1 ?
+                     (next_block >= dit->token_reduction_begin &&
+                      next_block < token_reduction_end) :
+                     (next_block == dit->token_reduction_begin ||
+                      next_block == token_reduction_end));
             int fuse_next_attention =
                 !getenv("H3_DISABLE_FUSED_CROSS_BLOCK_ADALN") &&
                 next_block < H3_DIT_BLOCKS &&

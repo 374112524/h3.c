@@ -606,6 +606,11 @@ h3_gpu_tensor *h3_gpu_tensor_from_u32(h3_gpu *gpu, const uint32_t *values,
     return h3_gpu_tensor_new(gpu, values, elements, sizeof(uint32_t), H3_GPU_U32);
 }
 
+h3_gpu_tensor *h3_gpu_tensor_from_i8(h3_gpu *gpu, const int8_t *values,
+                                     size_t elements) {
+    return h3_gpu_tensor_new(gpu, values, elements, sizeof(int8_t), H3_GPU_I8);
+}
+
 static h3_gpu_tensor *h3_gpu_tensor_load_file(h3_gpu *opaque, const char *path,
                                               uint64_t file_offset,
                                               size_t elements,
@@ -722,6 +727,12 @@ h3_gpu_tensor *h3_gpu_tensor_load_f32(h3_gpu *opaque, const char *path,
                                       uint64_t file_offset, size_t elements) {
     return h3_gpu_tensor_load_file(opaque, path, file_offset, elements,
                                    sizeof(float), H3_GPU_F32, "F32");
+}
+
+h3_gpu_tensor *h3_gpu_tensor_load_i8(h3_gpu *opaque, const char *path,
+                                     uint64_t file_offset, size_t elements) {
+    return h3_gpu_tensor_load_file(opaque, path, file_offset, elements,
+                                   sizeof(int8_t), H3_GPU_I8, "I8");
 }
 
 static int h3_gpu_tensor_read_file_bf16_mode(
@@ -873,6 +884,28 @@ int h3_gpu_tensor_write_bf16_range(h3_gpu_tensor *tensor,
     unsigned char *destination = TENSOR(tensor).buffer.contents;
     memcpy(destination + destination_offset * sizeof(uint16_t), values,
            elements * sizeof(uint16_t));
+    return 1;
+}
+
+int h3_gpu_tensor_read_i8_range(const h3_gpu_tensor *tensor,
+                                size_t source_offset, int8_t *values,
+                                size_t elements) {
+    if (!tensor || !values || TENSOR(tensor).dtype != H3_GPU_I8 ||
+        source_offset > TENSOR(tensor).elements ||
+        elements > TENSOR(tensor).elements - source_offset) return 0;
+    const unsigned char *source = TENSOR(tensor).buffer.contents;
+    memcpy(values, source + source_offset, elements);
+    return 1;
+}
+
+int h3_gpu_tensor_write_i8_range(h3_gpu_tensor *tensor,
+                                 size_t destination_offset,
+                                 const int8_t *values, size_t elements) {
+    if (!tensor || !values || TENSOR(tensor).dtype != H3_GPU_I8 ||
+        destination_offset > TENSOR(tensor).elements ||
+        elements > TENSOR(tensor).elements - destination_offset) return 0;
+    unsigned char *destination = TENSOR(tensor).buffer.contents;
+    memcpy(destination + destination_offset, values, elements);
     return 1;
 }
 

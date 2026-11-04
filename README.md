@@ -574,6 +574,43 @@ disables it. `H3_DISABLE_TOKEN_REDUCTION=1` provides an in-context exact oracle.
 `H3_DISABLE_FUSED_TOKEN_POOL_ADALN=1` and
 `H3_DISABLE_FUSED_TOKEN_ADALN=1` independently restore the two-kernel entry and
 exit boundaries for diagnosis.
+
+`H3_TOKEN_REDUCTION_ATTENTION_ONLY=1` replaces the pooled stack with
+attention-only merging. The residual stream, attention residual gate, and MLP
+stay on the full token grid; each reduced block pools the current residual,
+applies attention AdaLN to the pooled row, runs QKV/SDPA/out-projection on the
+paired grid, broadcasts that branch to every full-resolution child, and then
+gates the full residual and runs the MLP on full tokens. The branch broadcast
+uses a dedicated `h3_token_gather_bf16` kernel over the existing parent map, so
+text, audio, condition, and reference rows remain exact. Because the full
+stream is live, the pool runs at the start of every reduced block and no
+full-grid AdaLN may be fused across a reduced-block boundary.
+On 864x480x56 turbo8 8@7 the 4:30 stack cut denoise from 204.8 to 133.5 s with
+SSIM 0.689 and PSNR 17.78 dB against the untouched run; full token reduction on
+the same schedule reached 107.5 s at 0.671 / 16.69 dB. The full-token MLP keeps
+noticeably more fur detail, at a smaller speedup. At 12@16 the same stack took
+190.4 s against 233.2 s base and 166.7 s for full reduction (SSIM 0.714 versus
+0.754), but every `--shift 16` configuration tested is run-to-run
+nondeterministic: identical runs land on one of two outputs that differ by
+0.75-0.85 SSIM, so those two numbers are single draws. The `--shift 7` 8-step
+turbo recipe is bit-identical across repeated runs and carries every other
+number in this section. It adds one full-width residual snapshot and one branch
+buffer (2 x `sequence * HIDDEN` BF16) and forces the snapshot out of the QKV
+tail.
+
+`H3_TOKEN_REDUCTION_ATTENTION_ONLY=kv` is the narrower variant: QKV, the
+attention residual, output projection, and the MLP all stay full-resolution and
+only the SDPA key/value set is pooled right after RoPE. Queries keep their own
+rows, so no branch broadcast is needed; `h3_token_pool_avg_bf16` averages the
+paired rows in the projection's layout (head-major or row-major) and
+`h3_gpu_sdpa_bf16_split` runs MPSGraph SDPA with unequal query/key lengths.
+On 864x480x56 turbo8 8@7 this cut denoise from 204.8 to 161.6 s; on 1280x704x56
+it took 486.5 s against 610.0 s untouched and 433.1 s for the broadcast variant,
+with SSIM 0.680 versus 0.653. High-frequency energy stays at 0.9-1.1x the
+untouched render for both attention-only modes but falls to ~0.7x under full
+token reduction, confirming that the full-token MLP is what preserves detail.
+Relative SSIM flips between canvases because 8-step trajectories drift; neither
+attention-only mode is an exact win.
 Token reduction composes cleanly with the validated `--layers 45 --reuse 2`
 settings: on the same 512 benchmark it reduced that profile from 16.69 to
 12.60 seconds (24.5% marginal), and independent fox and surfer renders stayed

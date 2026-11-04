@@ -1,5 +1,6 @@
 #include "h3_internal.h"
 #include "h3_audio_vae.h"
+#include "h3_cache.h"
 #include "h3_host.h"
 #include "h3_dit.h"
 #include "h3_ffmpeg.h"
@@ -136,6 +137,26 @@ static int h3_key_file(h3_key *key, const char *role, const char *path) {
                          status.st_mtimespec.tv_nsec);
 }
 
+/* Env knobs that change the DiT structure or the decoder plan are read once
+ * per load, so they belong in the cache keys even though they never appear in
+ * h3_params. Without them a cached DiT could be reused with a different
+ * token-reduction range or tile plan. */
+static int h3_structure_key(h3_key *key) {
+    const char *const names[] = {
+        "H3_TOKEN_REDUCTION_BLOCKS", "H3_TOKEN_REDUCTION_SCALE",
+        "H3_TOKEN_REDUCTION_EARLY", "H3_TOKEN_REDUCTION_ATTENTION_ONLY",
+        "H3_ATTN_BCAST", "H3_STEP_CACHE", "H3_SKIP_CACHE",
+        "H3_VAE_TILE_PIXELS", "H3_VAE_PIPELINE", "H3_DIT_COMMAND_BLOCKS",
+        "H3_SIGMA_KNOTS", "H3_AUDIO_FROZEN"
+    };
+    for (size_t index = 0; index < sizeof(names) / sizeof(names[0]); index++) {
+        const char *value = getenv(names[index]);
+        if (!h3_key_append(key, "|%s=%s", names[index],
+                           value && *value ? value : "-")) return 0;
+    }
+    return 1;
+}
+
 static char *h3_conditioning_key(const char *prompt, const h3_params *params,
                                  int render_width, int render_height,
                                  int ref2va) {
@@ -161,20 +182,28 @@ failed:
     return NULL;
 }
 
+/* The prepared DiT bakes in the sigma schedule and the sampler's buffers, so
+ * both belong to the key: the schedule depends on the resolved flow shift
+ * (checkpoint default, LoRA recommendation, or H3_SIGMA_SHIFT) and the sampler
+ * decides which activation buffers h3_dit_load allocates. */
 static char *h3_prepared_key(const char *conditioning,
                              const h3_params *params,
-                             int render_width, int render_height) {
+                             int render_width, int render_height,
+                             int steps, float sigma_shift,
+                             float audio_shift, const char *sampler) {
     h3_key key = {0};
     if (!h3_key_append(
             &key,
             "%s|shape=%dx%dx%d|steps=%d|layers=%d|reuse-core=%d|reduce=%d"
-            "|row-fc2=%d|reference-rope=%d|ssd-streaming=%d"
+            "|row-fc2=%d|reference-rope=%d|ssd-streaming=%d|shift=%.6g/%.6g"
+            "|sampler=%s"
             "|slow=%d%d%d%d%d%d%d%d%d%d",
             conditioning, render_width, render_height, params->frames,
-            params->steps, params->dit_layers, params->core_reuse,
+            steps, params->dit_layers, params->core_reuse,
             params->token_reduction, params->use_int8_row_fc2,
             params->use_reference_rope,
-            params->ssd_streaming,
+            params->ssd_streaming, sigma_shift, audio_shift,
+            sampler ? sampler : "euler",
             params->use_slower_bf16_mlp,
             params->use_slower_bf16_qkv,
             params->use_slower_bf16_attention_output,

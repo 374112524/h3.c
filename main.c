@@ -675,6 +675,12 @@ int main(int argc, char **argv) {
                 params.preview_denoise = 1;
             }
         }
+        /* A single generation has nothing to reuse in-process, so the
+         * conditioning cache stays off unless a disk directory is configured -
+         * then this run reads from it and, with H3_COND_CACHE_WRITE, fills it. */
+        const char *conditioning_cache = getenv("H3_COND_CACHE");
+        if (conditioning_cache && *conditioning_cache)
+            h3_cache_set_enabled(ctx, 1);
         h3_result *result = h3_generate(ctx, prompt, &params);
         if (!result) {
             if (cli.active) fputc('\n', stderr);

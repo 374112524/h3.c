@@ -48,11 +48,15 @@ h3_gpu_tensor *h3_gpu_tensor_from_bf16(h3_gpu *gpu, const uint16_t *values,
                                        size_t elements);
 h3_gpu_tensor *h3_gpu_tensor_from_u32(h3_gpu *gpu, const uint32_t *values,
                                       size_t elements);
+h3_gpu_tensor *h3_gpu_tensor_from_i8(h3_gpu *gpu, const int8_t *values,
+                                     size_t elements);
 /* Allocate shared Metal storage and pread BF16 payload directly into it. */
 h3_gpu_tensor *h3_gpu_tensor_load_bf16(h3_gpu *gpu, const char *path,
                                        uint64_t file_offset, size_t elements);
 h3_gpu_tensor *h3_gpu_tensor_load_f32(h3_gpu *gpu, const char *path,
                                       uint64_t file_offset, size_t elements);
+h3_gpu_tensor *h3_gpu_tensor_load_i8(h3_gpu *gpu, const char *path,
+                                     uint64_t file_offset, size_t elements);
 /* Fill an existing shared BF16 buffer from a file. The tensor and its
  * accounting are unchanged, so this may run on an I/O thread while another
  * tensor is in flight on the GPU. */
@@ -82,6 +86,12 @@ int h3_gpu_tensor_write_f32_range(h3_gpu_tensor *tensor,
                                   const float *values, size_t elements);
 int h3_gpu_tensor_write_bf16(h3_gpu_tensor *tensor, const uint16_t *values,
                              size_t elements);
+int h3_gpu_tensor_read_i8_range(const h3_gpu_tensor *tensor,
+                                size_t source_offset, int8_t *values,
+                                size_t elements);
+int h3_gpu_tensor_write_i8_range(h3_gpu_tensor *tensor,
+                                 size_t destination_offset,
+                                 const int8_t *values, size_t elements);
 int h3_gpu_tensor_write_bf16_range(h3_gpu_tensor *tensor,
                                    size_t destination_offset,
                                    const uint16_t *values, size_t elements);
